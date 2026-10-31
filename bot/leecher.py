@@ -2,9 +2,7 @@ import asyncio
 import logging
 import re
 import shutil
-import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
 
 from PIL import Image
 from telethon.tl.types import DocumentAttributeVideo
@@ -12,7 +10,6 @@ from telethon.tl.types import DocumentAttributeVideo
 from bot.config import (
     CLEAN,
     COMPRESS_ABOVE_MB,
-    DOWNLOAD_DIR,
     FFMPEG_BIN,
     FFMPEG_VIDEO_CODEC,
     FFMPEG_AUDIO_CODEC,
@@ -38,8 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 def clean_title(title: str) -> str:
-    """Remove site branding and URLs from the title."""
-
     title = re.sub(
         r"https?://\S+|www\.\S+",
         "",
@@ -55,23 +50,36 @@ def clean_title(title: str) -> str:
     )
 
     title = re.sub(r"\s+", " ", title)
+
     return title.strip(" -_|")
 
 
 def make_slug(title: str) -> str:
-    title = clean_title(title) if CLEAN else title
+    if CLEAN:
+        title = clean_title(title)
 
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower())
-    slug = slug.strip("-")
+    slug = re.sub(
+        r"[^a-zA-Z0-9]+",
+        "-",
+        title.lower(),
+    )
 
-    return slug[:70] or "video"
+    return slug.strip("-")[:70] or "video"
 
 
-def make_caption(title: str, keywords: list[str]) -> str:
+def make_caption(
+    title: str,
+    keywords: list[str],
+) -> str:
+
     hashtags = []
 
     for keyword in keywords:
-        tag = re.sub(r"[^a-zA-Z0-9]", "", keyword.replace(" ", ""))
+        tag = re.sub(
+            r"[^a-zA-Z0-9]",
+            "",
+            keyword.replace(" ", ""),
+        )
 
         if tag:
             hashtags.append(f"#{tag}")
@@ -88,8 +96,6 @@ def make_caption(title: str, keywords: list[str]) -> str:
 
 
 async def run_ffmpeg(arguments: list[str]) -> None:
-    """Run FFmpeg without blocking the event loop."""
-
     process = await asyncio.create_subprocess_exec(
         FFMPEG_BIN,
         *arguments,
@@ -100,7 +106,11 @@ async def run_ffmpeg(arguments: list[str]) -> None:
     _, stderr = await process.communicate()
 
     if process.returncode != 0:
-        error = stderr.decode("utf-8", errors="ignore")[-1500:]
+        error = stderr.decode(
+            "utf-8",
+            errors="ignore",
+        )[-1500:]
+
         raise RuntimeError(f"FFmpeg failed: {error}")
 
 
@@ -139,8 +149,6 @@ async def compress_video(input_path: Path) -> Path:
 
 
 async def strip_metadata(input_path: Path) -> Path:
-    """Remove metadata without re-encoding the video."""
-
     output_path = input_path.with_name(
         f"{input_path.stem}_clean.mp4"
     )
@@ -169,8 +177,6 @@ async def strip_metadata(input_path: Path) -> Path:
 
 
 def prepare_thumbnail(input_path: Path) -> Path:
-    """Convert thumbnail to a small JPEG suitable for Telegram."""
-
     output_path = input_path.with_suffix(".jpg")
 
     with Image.open(input_path) as image:
@@ -179,7 +185,7 @@ def prepare_thumbnail(input_path: Path) -> Path:
 
         quality = 85
 
-        while True:
+        while quality >= 35:
             image.save(
                 output_path,
                 "JPEG",
@@ -188,19 +194,18 @@ def prepare_thumbnail(input_path: Path) -> Path:
             )
 
             if output_path.stat().st_size <= 190 * 1024:
-                break
+                return output_path
 
             quality -= 10
 
-            if quality < 35:
-                output_path.unlink(missing_ok=True)
-                raise RuntimeError("Could not optimize thumbnail.")
+    output_path.unlink(missing_ok=True)
 
-    return output_path
+    raise RuntimeError("Could not optimize thumbnail.")
 
 
-async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
-    """Read video dimensions using ffprobe."""
+async def get_video_dimensions(
+    video_path: Path,
+) -> tuple[int, int]:
 
     ffprobe = shutil.which("ffprobe")
 
@@ -223,6 +228,7 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
     try:
         width, height = stdout.decode().strip().split("x")
         return int(width), int(height)
+
     except (ValueError, TypeError):
         return 1280, 720
 
@@ -231,24 +237,29 @@ async def process_video(
     bot_client,
     message,
     url: str,
+    selected_resolution: int | None = None,
 ) -> None:
-    """Download an Eporner video and send it to the same Telegram chat."""
 
     video_id = parse_id(url)
 
     if await seen(video_id):
-        await message.reply("ℹ️ This video has already been downloaded.")
+        await message.reply(
+            "ℹ️ This video has already been downloaded."
+        )
+        return
+
+    if selected_resolution is None:
+        selected_resolution = MAX_RES
+
+    if selected_resolution not in (480, 720, 1080):
+        await message.reply("❌ Invalid video quality.")
         return
 
     progress_message = await message.reply(
         "🔎 Fetching video information..."
     )
 
-    downloaded_path = None
-    thumbnail_path = None
-    prepared_thumbnail = None
-    compressed_path = None
-    clean_path = None
+    temporary_files = []
 
     try:
         metadata = await fetch_meta(video_id)
@@ -256,24 +267,41 @@ async def process_video(
         title = get_title(metadata)
         display_title = clean_title(title) if CLEAN else title
 
-        source = pick_source(metadata, MAX_RES)
+        source = pick_source(
+            metadata,
+            max_res=selected_resolution,
+        )
+
+        actual_resolution = int(
+            re.search(
+                r"\d+",
+                source["resolution"],
+            ).group()
+        )
+
+        if actual_resolution != selected_resolution:
+            raise RuntimeError(
+                f"Selected {selected_resolution}P stream is unavailable."
+            )
+
         video_url = source["url"]
 
         duration = get_duration(metadata)
         keywords = get_keywords(metadata)
 
-        slug = make_slug(title)
-        filename = f"{slug}_{video_id}.mp4"
+        filename = (
+            f"{make_slug(title)}_{video_id}.mp4"
+        )
 
         await progress_message.edit(
-            "📥 Download starting..."
+            f"📥 Downloading {selected_resolution}P..."
         )
 
         async def update_progress(current: int, total: int):
             percent = int(current * 100 / total)
 
             await progress_message.edit(
-                f"📥 Downloading: {percent}%\n"
+                f"📥 Downloading {selected_resolution}P: {percent}%\n"
                 f"📦 {human(current)} / {human(total)}"
             )
 
@@ -283,28 +311,43 @@ async def process_video(
             progress_callback=update_progress,
         )
 
+        temporary_files.append(downloaded_path)
+
         final_path = downloaded_path
 
-        file_size_mb = downloaded_path.stat().st_size / (1024 * 1024)
+        file_size_mb = (
+            downloaded_path.stat().st_size / (1024 * 1024)
+        )
 
         if file_size_mb > COMPRESS_ABOVE_MB:
+
             await progress_message.edit(
                 "🗜 Compressing video...\n"
                 f"Original size: {human(downloaded_path.stat().st_size)}"
             )
 
-            compressed_path = await compress_video(downloaded_path)
+            compressed_path = await compress_video(
+                downloaded_path
+            )
+
+            temporary_files.append(compressed_path)
             final_path = compressed_path
 
         elif CLEAN:
+
             await progress_message.edit(
                 "🧹 Removing video metadata..."
             )
 
-            clean_path = await strip_metadata(downloaded_path)
+            clean_path = await strip_metadata(
+                downloaded_path
+            )
+
+            temporary_files.append(clean_path)
             final_path = clean_path
 
         thumbnail_url = get_thumbnail(metadata)
+        prepared_thumbnail = None
 
         if thumbnail_url:
             try:
@@ -313,16 +356,23 @@ async def process_video(
                     f"{video_id}_thumb",
                 )
 
-                prepared_thumbnail = prepare_thumbnail(thumbnail_path)
+                temporary_files.append(thumbnail_path)
+
+                prepared_thumbnail = prepare_thumbnail(
+                    thumbnail_path
+                )
+
+                temporary_files.append(prepared_thumbnail)
 
             except Exception:
                 logger.warning(
-                    "Thumbnail preparation failed for %s",
-                    video_id,
+                    "Thumbnail preparation failed.",
                     exc_info=True,
                 )
 
-        width, height = await get_video_dimensions(final_path)
+        width, height = await get_video_dimensions(
+            final_path
+        )
 
         caption = make_caption(
             display_title,
@@ -339,14 +389,18 @@ async def process_video(
         ]
 
         await progress_message.edit(
-            "📤 Uploading video to Telegram..."
+            f"📤 Uploading {selected_resolution}P video..."
         )
 
         sent_message = await bot_client.send_file(
             entity=message.chat_id,
             file=str(final_path),
             caption=caption,
-            thumb=str(prepared_thumbnail) if prepared_thumbnail else None,
+            thumb=(
+                str(prepared_thumbnail)
+                if prepared_thumbnail
+                else None
+            ),
             attributes=attributes,
             supports_streaming=True,
             reply_to=message.id,
@@ -360,8 +414,9 @@ async def process_video(
         await progress_message.delete()
 
         logger.info(
-            "Video %s sent successfully to chat %s",
+            "Video %s sent in %sP to chat %s",
             video_id,
+            selected_resolution,
             message.chat_id,
         )
 
@@ -379,19 +434,11 @@ async def process_video(
             pass
 
     finally:
-        # Remove downloaded and processed files.
-        for path in (
-            downloaded_path,
-            compressed_path,
-            clean_path,
-            thumbnail_path,
-            prepared_thumbnail,
-        ):
-            if path:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    logger.warning(
-                        "Could not remove temporary file: %s",
-                        path,
-                    )
+        for path in temporary_files:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                logger.warning(
+                    "Could not remove temporary file: %s",
+                    path,
+                )
