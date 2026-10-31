@@ -1,0 +1,45 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Downloaded videos and thumbnails
+downloads/*
+!downloads/.gitkeep
+
+# Database
+data/*
+!data/.gitkeep
+*.sqlite3
+*.db
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.part
+*.tmp
