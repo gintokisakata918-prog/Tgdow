@@ -30,38 +30,64 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
-bot_client = TelegramClient(
-    "eporner_bot",
-    API_ID,
-    API_HASH,
-)
+bot_client = TelegramClient("eporner_bot", API_ID, API_HASH)
 
 
-# --------------------------------------------------
-# HEALTH SERVER
-# --------------------------------------------------
+def find_qualities(metadata):
+    """Find available qualities from different source formats."""
+
+    found = set()
+
+    def scan(value):
+        if isinstance(value, dict):
+
+            for key, item in value.items():
+
+                resolution = get_resolution(str(key))
+
+                if resolution in (480, 720, 1080):
+                    found.add(resolution)
+
+                scan(item)
+
+        elif isinstance(value, list):
+
+            for item in value:
+                scan(item)
+
+        elif isinstance(value, str):
+
+            resolution = get_resolution(value)
+
+            if resolution in (480, 720, 1080):
+                found.add(resolution)
+
+    scan(metadata.get("videos", {}))
+    scan(metadata.get("sources", {}))
+
+    return sorted(found)
+
 
 async def health_server():
+
     async def handle_client(reader, writer):
         try:
             request = await reader.read(1024)
 
             if b"GET /health" in request:
-                response = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/plain\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b"OK"
-                )
+                body = b"OK"
+                status = b"200 OK"
             else:
-                response = (
-                    b"HTTP/1.1 404 Not Found\r\n"
-                    b"Content-Length: 9\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b"Not Found"
-                )
+                body = b"Not Found"
+                status = b"404 Not Found"
+
+            response = (
+                b"HTTP/1.1 " + status + b"\r\n"
+                b"Content-Type: text/plain\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + body
+            )
 
             writer.write(response)
             await writer.drain()
@@ -85,49 +111,26 @@ async def health_server():
         await server.serve_forever()
 
 
-# --------------------------------------------------
-# START COMMAND
-# --------------------------------------------------
-
 @bot_client.on(events.NewMessage(pattern=r"^/start$"))
 async def start_command(event):
-
     await event.reply(
         "👋 Hello!\n\n"
-        "Send me an Eporner video link to download it."
+        "Send an Eporner video link."
     )
 
-
-# --------------------------------------------------
-# HELP COMMAND
-# --------------------------------------------------
 
 @bot_client.on(events.NewMessage(pattern=r"^/help$"))
 async def help_command(event):
-
     await event.reply(
-        "📖 **How to use:**\n\n"
-        "1. Send an Eporner video link.\n"
-        "2. Select video quality.\n"
-        "3. Wait for the download.\n"
-        "4. Receive your video here.\n\n"
-        "Available qualities depend on the video."
+        "📖 Send an Eporner video link.\n"
+        "Select quality and wait for your video."
     )
 
 
-# --------------------------------------------------
-# STATUS COMMAND
-# --------------------------------------------------
-
 @bot_client.on(events.NewMessage(pattern=r"^/status$"))
 async def status_command(event):
-
     await event.reply("✅ Bot is running.")
 
-
-# --------------------------------------------------
-# VIDEO URL HANDLER
-# --------------------------------------------------
 
 @bot_client.on(
     events.NewMessage(
@@ -144,42 +147,49 @@ async def status_command(event):
 async def video_handler(event):
 
     if ALLOWED_USERS and event.sender_id not in ALLOWED_USERS:
-        await event.reply("⛔ You are not authorized to use this bot.")
+        await event.reply("⛔ You are not authorized.")
         return
 
-    url_match = re.search(
+    match = re.search(
         r"https?://\S+",
         event.raw_text or "",
     )
 
-    if not url_match:
+    if not match:
         return
 
-    video_url = url_match.group(0).rstrip(".,)")
+    video_url = match.group(0).rstrip(".,)")
     status = await event.reply("🔎 Fetching video information...")
 
     try:
         video_id = parse_id(video_url)
 
         if not video_id:
-            await status.edit("❌ Invalid Eporner video link.")
+            await status.edit("❌ Invalid video link.")
             return
 
         metadata = await fetch_meta(video_id)
 
-        videos = metadata.get("videos", [])
+        if not isinstance(metadata, dict):
+            raise ValueError("Invalid metadata response")
 
-        available = set()
+        qualities = find_qualities(metadata)
 
-        for video in videos:
-            resolution = get_resolution(video)
+        logger.info(
+            "Video %s available qualities: %s",
+            video_id,
+            qualities,
+        )
 
-            if resolution in (480, 720, 1080):
-                available.add(resolution)
+        logger.info(
+            "Metadata keys: %s",
+            list(metadata.keys()),
+        )
 
-        if not available:
+        if not qualities:
             await status.edit(
-                "❌ No supported video qualities found."
+                "❌ No supported qualities found.\n\n"
+                "Player source extraction needs fixing."
             )
             return
 
@@ -189,7 +199,7 @@ async def video_handler(event):
 
         for quality in (480, 720, 1080):
 
-            if quality in available:
+            if quality in qualities:
 
                 row.append(
                     Button.inline(
@@ -217,10 +227,6 @@ async def video_handler(event):
         )
 
 
-# --------------------------------------------------
-# QUALITY CALLBACK
-# --------------------------------------------------
-
 @bot_client.on(events.CallbackQuery(pattern=b"^dl:"))
 async def quality_callback(event):
 
@@ -239,15 +245,11 @@ async def quality_callback(event):
         resolution = int(quality_text)
 
         if resolution not in (480, 720, 1080):
-            await event.answer(
-                "Invalid quality.",
-                alert=True,
-            )
+            await event.answer("Invalid quality.", alert=True)
             return
 
         await event.answer("Quality selected!")
 
-        # Callback message ko retrieve karo.
         callback_message = await event.get_message()
 
         await callback_message.edit(
@@ -272,51 +274,32 @@ async def quality_callback(event):
 
         try:
             await event.answer(
-                "Download failed. Check bot logs.",
+                "Download failed. Check logs.",
                 alert=True,
             )
         except Exception:
             pass
 
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
-
 async def main():
 
     validate_config()
 
-    await bot_client.start(
-        bot_token=BOT_TOKEN,
-    )
+    await bot_client.start(bot_token=BOT_TOKEN)
 
     me = await bot_client.get_me()
 
-    logger.info(
-        "Telegram bot connected: @%s",
-        me.username,
-    )
+    logger.info("Bot connected: @%s", me.username)
 
-    health_task = asyncio.create_task(
-        health_server()
-    )
-
-    logger.info("Bot is running.")
+    health_task = asyncio.create_task(health_server())
 
     try:
         await bot_client.run_until_disconnected()
 
     finally:
         health_task.cancel()
-
         await bot_client.disconnect()
 
 
 if __name__ == "__main__":
-
-    try:
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-        logger.info("Bot stopped.")
+    asyncio.run(main())
