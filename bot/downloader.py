@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -11,21 +12,16 @@ from bot.config import (
     DOWNLOAD_DIR,
 )
 
-
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
 
 def human(size: int) -> str:
-    """Convert bytes into human-readable size."""
-
     units = ["B", "KB", "MB", "GB", "TB"]
-
     value = float(size)
 
     for unit in units:
         if value < 1024 or unit == units[-1]:
             return f"{value:.2f} {unit}"
-
         value /= 1024
 
     return f"{value:.2f} TB"
@@ -36,20 +32,11 @@ async def download(
     filename: str,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
-    """
-    Download video using HTTP streaming.
-
-    Downloads in 1MB chunks.
-    CDN Referer is included to prevent HTTP 403 errors.
-    """
 
     if not url.startswith("https://"):
         raise ValueError("Only HTTPS download URLs are supported.")
 
-    DOWNLOAD_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     output_path = DOWNLOAD_DIR / filename
     temporary_path = output_path.with_suffix(
@@ -64,7 +51,8 @@ async def download(
     }
 
     downloaded = 0
-    last_percent = -1
+    last_update = 0
+    start_time = time.monotonic()
 
     try:
         timeout = httpx.Timeout(
@@ -80,18 +68,12 @@ async def download(
             follow_redirects=True,
         ) as client:
 
-            async with client.stream(
-                "GET",
-                url,
-            ) as response:
+            async with client.stream("GET", url) as response:
 
                 response.raise_for_status()
 
                 total = int(
-                    response.headers.get(
-                        "content-length",
-                        0,
-                    )
+                    response.headers.get("content-length", 0)
                 )
 
                 with open(temporary_path, "wb") as file:
@@ -106,22 +88,19 @@ async def download(
                         file.write(chunk)
                         downloaded += len(chunk)
 
-                        if progress_callback and total > 0:
+                        current_time = time.monotonic()
 
-                            percent = min(
-                                100,
-                                int(downloaded * 100 / total),
+                        if (
+                            progress_callback
+                            and current_time - last_update >= 2
+                        ):
+
+                            await progress_callback(
+                                downloaded,
+                                total,
                             )
 
-                            step = percent // 10
-
-                            if step > last_percent // 10:
-                                last_percent = percent
-
-                                await progress_callback(
-                                    downloaded,
-                                    total,
-                                )
+                            last_update = current_time
 
         if downloaded == 0:
             raise RuntimeError("Downloaded file is empty.")
@@ -131,17 +110,17 @@ async def download(
             output_path,
         )
 
+        if progress_callback:
+            await progress_callback(
+                downloaded,
+                total,
+            )
+
         return output_path
 
     except Exception:
-        temporary_path.unlink(
-            missing_ok=True
-        )
-
-        output_path.unlink(
-            missing_ok=True
-        )
-
+        temporary_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
         raise
 
 
@@ -153,10 +132,7 @@ async def download_thumbnail(
     if not url.startswith("https://"):
         raise ValueError("Invalid thumbnail URL.")
 
-    DOWNLOAD_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     output_path = DOWNLOAD_DIR / filename
 
@@ -178,14 +154,10 @@ async def download_thumbnail(
             if not response.content:
                 raise RuntimeError("Thumbnail is empty.")
 
-            output_path.write_bytes(
-                response.content
-            )
+            output_path.write_bytes(response.content)
 
         return output_path
 
     except Exception:
-        output_path.unlink(
-            missing_ok=True
-        )
+        output_path.unlink(missing_ok=True)
         raise
