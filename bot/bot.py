@@ -4,24 +4,19 @@ import re
 import sys
 
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 
 from bot.config import (
     API_ID,
     API_HASH,
-    STRING_SESSION,
     BOT_TOKEN,
     ALLOWED_USERS,
+    HOST,
+    PORT,
     validate_config,
 )
-
 from bot.database import init_db
 from bot.leecher import process_video
 
-
-# =========================
-# Logging
-# =========================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,58 +25,77 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
-# =========================
-# Clients
-# =========================
-
+# Telegram bot client
 bot_client = TelegramClient(
     "eporner_bot",
     API_ID,
     API_HASH,
 )
 
-user_client = TelegramClient(
-    StringSession(STRING_SESSION),
-    API_ID,
-    API_HASH,
-)
-
-
-# =========================
-# URL Detection
-# =========================
-
+# Supported Eporner URLs
 EPORNER_PATTERN = re.compile(
     r"https?://(?:www\.)?eporner\.com/"
-    r"(?:video-|hd-porn/)[A-Za-z0-9]{5,12}"
-    r"[^\s]*",
+    r"(?:video-|hd-porn/)[A-Za-z0-9]{5,12}[^\s]*",
     re.IGNORECASE,
 )
 
 
-# =========================
-# Authorization
-# =========================
-
-def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USERS:
+def is_authorized(user_id: int | None) -> bool:
+    if not ALLOWED_USERS or user_id is None:
         return False
 
     return user_id in ALLOWED_USERS
 
 
-# =========================
-# Start Command
-# =========================
+async def health_handler(reader, writer):
+    """Minimal HTTP health endpoint for Render."""
 
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/start(?:@\w+)?$"
-    )
-)
+    try:
+        request = await asyncio.wait_for(
+            reader.readline(),
+            timeout=5,
+        )
+
+        parts = request.decode(
+            "utf-8",
+            errors="ignore",
+        ).strip().split()
+
+        path = parts[1] if len(parts) >= 2 else "/"
+
+        if path == "/health":
+            status = "200 OK"
+            body = "OK"
+        else:
+            status = "404 Not Found"
+            body = "Not Found"
+
+        response = (
+            f"HTTP/1.1 {status}\r\n"
+            "Content-Type: text/plain\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            f"{body}"
+        )
+
+        writer.write(response.encode("utf-8"))
+        await writer.drain()
+
+    except Exception:
+        logger.debug("Health check request failed.")
+
+    finally:
+        writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
 async def start_handler(event):
-
     if not is_authorized(event.sender_id):
         await event.reply(
             "⛔ You are not authorized to use this bot."
@@ -98,17 +112,8 @@ async def start_handler(event):
     )
 
 
-# =========================
-# Help Command
-# =========================
-
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/help(?:@\w+)?$"
-    )
-)
+@bot_client.on(events.NewMessage(pattern=r"^/help(?:@\w+)?$"))
 async def help_handler(event):
-
     if not is_authorized(event.sender_id):
         return
 
@@ -122,17 +127,8 @@ async def help_handler(event):
     )
 
 
-# =========================
-# Status Command
-# =========================
-
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/status(?:@\w+)?$"
-    )
-)
+@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
 async def status_handler(event):
-
     if not is_authorized(event.sender_id):
         return
 
@@ -143,10 +139,6 @@ async def status_handler(event):
     )
 
 
-# =========================
-# Video Processing
-# =========================
-
 @bot_client.on(
     events.NewMessage(
         incoming=True,
@@ -154,7 +146,6 @@ async def status_handler(event):
     )
 )
 async def video_handler(event):
-
     if not is_authorized(event.sender_id):
         return
 
@@ -168,63 +159,71 @@ async def video_handler(event):
     if not match:
         return
 
-    video_url = match.group(0).rstrip(
-        ".,!?;:)]}"
-    )
+    video_url = match.group(0).rstrip(".,!?;:)]}")
 
     logger.info(
         "Video request received from user %s",
         event.sender_id,
     )
 
-    await process_video(
-        bot_client=bot_client,
-        user_client=user_client,
-        message=event.message,
-        url=video_url,
-    )
+    try:
+        await process_video(
+            bot_client=bot_client,
+            message=event.message,
+            url=video_url,
+        )
 
+    except Exception:
+        logger.exception("Video processing failed.")
+        await event.reply(
+            "❌ Something went wrong while processing this video."
+        )
 
-# =========================
-# Main
-# =========================
 
 async def main():
-
     logger.info("Starting Eporner Leech Bot...")
 
     validate_config()
-
     await init_db()
 
-    # Start MTProto user session
-    await user_client.start()
-
-    logger.info(
-        "MTProto user session connected."
-    )
-
-    # Start Telegram bot
-    await bot_client.start(
-        bot_token=BOT_TOKEN
+    # Start health endpoint for Render
+    health_server = await asyncio.start_server(
+        health_handler,
+        HOST,
+        PORT,
     )
 
     logger.info(
-        "Telegram bot connected."
+        "Health server running at %s:%s",
+        HOST,
+        PORT,
     )
 
-    me = await bot_client.get_me()
+    try:
+        # Start Telegram bot
+        await bot_client.start(
+            bot_token=BOT_TOKEN,
+        )
 
-    logger.info(
-        "Bot started: @%s",
-        me.username,
-    )
+        me = await bot_client.get_me()
 
-    await bot_client.run_until_disconnected()
+        logger.info(
+            "Telegram bot connected: @%s",
+            me.username,
+        )
+
+        await bot_client.run_until_disconnected()
+
+    finally:
+        health_server.close()
+        await health_server.wait_closed()
+
+        await bot_client.disconnect()
+
+        logger.info("Bot shutdown complete.")
 
 
 if __name__ == "__main__":
-
     try:
         asyncio.run(main())
 
@@ -234,6 +233,3 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("Fatal startup error.")
         sys.exit(1)
-
-    finally:
-        logger.info("Shutdown complete.")
