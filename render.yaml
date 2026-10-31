@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: eporner-leech-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+
+      - key: API_ID
+        sync: false
+
+      - key: API_HASH
+        sync: false
+
+      - key: STRING_SESSION
+        sync: false
+
+      - key: BOT_TOKEN
+        sync: false
+
+      - key: TARGET_CHANNEL
+        sync: false
+
+      - key: ALLOWED_USERS
+        sync: false
+
+      - key: MAX_RES
+        value: "1080"
+
+      - key: COMPRESS_ABOVE_MB
+        value: "500"
+
+      - key: CLEAN
+        value: "true"
+
+      - key: PORT
+        value: "8080"
