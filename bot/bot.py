@@ -3,7 +3,7 @@ import logging
 import re
 import sys
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 
 from bot.config import (
     API_ID,
@@ -14,7 +14,14 @@ from bot.config import (
     PORT,
     validate_config,
 )
+
 from bot.database import init_db
+from bot.eporner import (
+    fetch_meta,
+    get_resolution,
+    NoStreamsAvailableError,
+)
+
 from bot.leecher import process_video
 
 
@@ -25,19 +32,19 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Telegram bot client
 bot_client = TelegramClient(
     "eporner_bot",
     API_ID,
     API_HASH,
 )
 
-# Supported Eporner URLs
 EPORNER_PATTERN = re.compile(
     r"https?://(?:www\.)?eporner\.com/"
     r"(?:video-|hd-porn/)[A-Za-z0-9]{5,12}[^\s]*",
     re.IGNORECASE,
 )
+
+QUALITY_OPTIONS = [480, 720, 1080]
 
 
 def is_authorized(user_id: int | None) -> bool:
@@ -48,8 +55,6 @@ def is_authorized(user_id: int | None) -> bool:
 
 
 async def health_handler(reader, writer):
-    """Minimal HTTP health endpoint for Render."""
-
     try:
         request = await asyncio.wait_for(
             reader.readline(),
@@ -94,7 +99,11 @@ async def health_handler(reader, writer):
             pass
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
+@bot_client.on(
+    events.NewMessage(
+        pattern=r"^/start(?:@\w+)?$"
+    )
+)
 async def start_handler(event):
     if not is_authorized(event.sender_id):
         await event.reply(
@@ -112,22 +121,29 @@ async def start_handler(event):
     )
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/help(?:@\w+)?$"))
+@bot_client.on(
+    events.NewMessage(
+        pattern=r"^/help(?:@\w+)?$"
+    )
+)
 async def help_handler(event):
     if not is_authorized(event.sender_id):
         return
 
     await event.reply(
         "📖 Eporner Leech Bot Help\n\n"
-        "1. Open Eporner.\n"
-        "2. Copy a publicly accessible video URL.\n"
-        "3. Send the URL here.\n"
-        "4. Wait for processing and upload.\n\n"
-        "Only supported Eporner video URLs are accepted."
+        "1. Send an Eporner video URL.\n"
+        "2. Select video quality.\n"
+        "3. Wait for download and upload.\n\n"
+        "Supported qualities depend on video availability."
     )
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
+@bot_client.on(
+    events.NewMessage(
+        pattern=r"^/status(?:@\w+)?$"
+    )
+)
 async def status_handler(event):
     if not is_authorized(event.sender_id):
         return
@@ -161,23 +177,112 @@ async def video_handler(event):
 
     video_url = match.group(0).rstrip(".,!?;:)]}")
 
-    logger.info(
-        "Video request received from user %s",
-        event.sender_id,
+    status_message = await event.reply(
+        "🔎 Checking available video qualities..."
     )
 
     try:
+        video_id = re.search(
+            r"(?:video-|hd-porn/)([A-Za-z0-9]{5,12})",
+            video_url,
+            re.IGNORECASE,
+        ).group(1)
+
+        metadata = await fetch_meta(video_id)
+
+        available = {
+            get_resolution(stream.get("resolution", ""))
+            for stream in metadata.get("videos", [])
+        }
+
+        buttons = []
+
+        for quality in QUALITY_OPTIONS:
+            if quality in available:
+                buttons.append(
+                    Button.inline(
+                        f"🎬 {quality}P",
+                        data=f"dl:{video_id}:{quality}".encode(),
+                    )
+                )
+
+        if not buttons:
+            raise NoStreamsAvailableError(
+                "480P, 720P ya 1080P mein koi stream available nahi hai."
+            )
+
+        keyboard = [buttons]
+
+        await status_message.edit(
+            "🎬 **Select Video Quality**\n\n"
+            "Apni preferred quality choose karo:",
+            buttons=keyboard,
+        )
+
+    except Exception as exc:
+        logger.exception("Could not fetch video qualities.")
+
+        await status_message.edit(
+            f"❌ Could not load video qualities:\n{str(exc)[:500]}"
+        )
+
+
+@bot_client.on(events.CallbackQuery)
+async def quality_callback(event):
+    if not is_authorized(event.sender_id):
+        await event.answer(
+            "You are not authorized.",
+            alert=True,
+        )
+        return
+
+    try:
+        data = event.data.decode("utf-8")
+
+        if not data.startswith("dl:"):
+            return
+
+        _, video_id, resolution = data.split(":")
+
+        resolution = int(resolution)
+
+        if resolution not in QUALITY_OPTIONS:
+            await event.answer(
+                "Invalid quality selection.",
+                alert=True,
+            )
+            return
+
+        await event.answer(
+            f"{resolution}P selected!"
+        )
+
+        await event.edit(
+            f"✅ Selected quality: {resolution}P\n"
+            "⏳ Preparing download..."
+        )
+
+        video_url = (
+            f"https://www.eporner.com/video-{video_id}/"
+        )
+
         await process_video(
             bot_client=bot_client,
             message=event.message,
             url=video_url,
+            selected_resolution=resolution,
         )
 
     except Exception:
-        logger.exception("Video processing failed.")
-        await event.reply(
-            "❌ Something went wrong while processing this video."
-        )
+        logger.exception("Quality callback failed.")
+
+        try:
+            await event.answer(
+                "Something went wrong.",
+                alert=True,
+            )
+        except Exception:
+            pass
 
 
 async def main():
@@ -186,7 +291,6 @@ async def main():
     validate_config()
     await init_db()
 
-    # Start health endpoint for Render
     health_server = await asyncio.start_server(
         health_handler,
         HOST,
@@ -200,7 +304,6 @@ async def main():
     )
 
     try:
-        # Start Telegram bot
         await bot_client.start(
             bot_token=BOT_TOKEN,
         )
