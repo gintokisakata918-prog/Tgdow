@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-import sys
 
 from telethon import TelegramClient, events, Button
 
@@ -15,11 +14,10 @@ from bot.config import (
     validate_config,
 )
 
-from bot.database import init_db
 from bot.eporner import (
+    parse_id,
     fetch_meta,
     get_resolution,
-    NoStreamsAvailableError,
 )
 
 from bot.leecher import process_video
@@ -32,204 +30,201 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
 bot_client = TelegramClient(
     "eporner_bot",
     API_ID,
     API_HASH,
 )
 
-EPORNER_PATTERN = re.compile(
-    r"https?://(?:www\.)?eporner\.com/"
-    r"(?:video-|hd-porn/)[A-Za-z0-9]{5,12}[^\s]*",
-    re.IGNORECASE,
-)
 
-QUALITY_OPTIONS = [480, 720, 1080]
+# --------------------------------------------------
+# HEALTH SERVER
+# --------------------------------------------------
 
-
-def is_authorized(user_id: int | None) -> bool:
-    if not ALLOWED_USERS or user_id is None:
-        return False
-
-    return user_id in ALLOWED_USERS
-
-
-async def health_handler(reader, writer):
-    try:
-        request = await asyncio.wait_for(
-            reader.readline(),
-            timeout=5,
-        )
-
-        parts = request.decode(
-            "utf-8",
-            errors="ignore",
-        ).strip().split()
-
-        path = parts[1] if len(parts) >= 2 else "/"
-
-        if path == "/health":
-            status = "200 OK"
-            body = "OK"
-        else:
-            status = "404 Not Found"
-            body = "Not Found"
-
-        response = (
-            f"HTTP/1.1 {status}\r\n"
-            "Content-Type: text/plain\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            f"{body}"
-        )
-
-        writer.write(response.encode("utf-8"))
-        await writer.drain()
-
-    except Exception:
-        logger.debug("Health check request failed.")
-
-    finally:
-        writer.close()
-
+async def health_server():
+    async def handle_client(reader, writer):
         try:
-            await writer.wait_closed()
+            request = await reader.read(1024)
+
+            if b"GET /health" in request:
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"OK"
+                )
+            else:
+                response = (
+                    b"HTTP/1.1 404 Not Found\r\n"
+                    b"Content-Length: 9\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"Not Found"
+                )
+
+            writer.write(response)
+            await writer.drain()
+
         except Exception:
-            pass
+            logger.exception("Health server error")
 
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/start(?:@\w+)?$"
+    server = await asyncio.start_server(
+        handle_client,
+        HOST,
+        PORT,
     )
-)
-async def start_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.reply(
-            "⛔ You are not authorized to use this bot."
-        )
-        return
+
+    logger.info("Health server running on port %s", PORT)
+
+    async with server:
+        await server.serve_forever()
+
+
+# --------------------------------------------------
+# START COMMAND
+# --------------------------------------------------
+
+@bot_client.on(events.NewMessage(pattern=r"^/start$"))
+async def start_command(event):
 
     await event.reply(
-        "👋 Welcome to Eporner Leech Bot!\n\n"
-        "Send an Eporner video URL to download it.\n\n"
-        "Commands:\n"
-        "/start - Start bot\n"
-        "/help - Help\n"
-        "/status - Check bot status"
+        "👋 Hello!\n\n"
+        "Send me an Eporner video link to download it."
     )
 
 
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/help(?:@\w+)?$"
-    )
-)
-async def help_handler(event):
-    if not is_authorized(event.sender_id):
-        return
+# --------------------------------------------------
+# HELP COMMAND
+# --------------------------------------------------
+
+@bot_client.on(events.NewMessage(pattern=r"^/help$"))
+async def help_command(event):
 
     await event.reply(
-        "📖 Eporner Leech Bot Help\n\n"
-        "1. Send an Eporner video URL.\n"
+        "📖 **How to use:**\n\n"
+        "1. Send an Eporner video link.\n"
         "2. Select video quality.\n"
-        "3. Wait for download and upload.\n\n"
-        "Supported qualities depend on video availability."
+        "3. Wait for the download.\n"
+        "4. Receive your video here.\n\n"
+        "Available qualities depend on the video."
     )
 
 
-@bot_client.on(
-    events.NewMessage(
-        pattern=r"^/status(?:@\w+)?$"
-    )
-)
-async def status_handler(event):
-    if not is_authorized(event.sender_id):
-        return
+# --------------------------------------------------
+# STATUS COMMAND
+# --------------------------------------------------
 
-    await event.reply(
-        "🟢 Bot is running.\n"
-        "📡 Telegram connection active.\n"
-        "⚙️ Download engine ready."
-    )
+@bot_client.on(events.NewMessage(pattern=r"^/status$"))
+async def status_command(event):
 
+    await event.reply("✅ Bot is running.")
+
+
+# --------------------------------------------------
+# VIDEO URL HANDLER
+# --------------------------------------------------
 
 @bot_client.on(
     events.NewMessage(
         incoming=True,
-        func=lambda event: bool(event.raw_text),
+        func=lambda event: bool(
+            re.search(
+                r"https?://(?:www\.)?eporner\.com/",
+                event.raw_text or "",
+                re.IGNORECASE,
+            )
+        ),
     )
 )
 async def video_handler(event):
-    if not is_authorized(event.sender_id):
+
+    if ALLOWED_USERS and event.sender_id not in ALLOWED_USERS:
+        await event.reply("⛔ You are not authorized to use this bot.")
         return
 
-    text = event.raw_text.strip()
-
-    if text.startswith("/"):
-        return
-
-    match = EPORNER_PATTERN.search(text)
-
-    if not match:
-        return
-
-    video_url = match.group(0).rstrip(".,!?;:)]}")
-
-    status_message = await event.reply(
-        "🔎 Checking available video qualities..."
+    url_match = re.search(
+        r"https?://\S+",
+        event.raw_text or "",
     )
 
+    if not url_match:
+        return
+
+    video_url = url_match.group(0).rstrip(".,)")
+    status = await event.reply("🔎 Fetching video information...")
+
     try:
-        video_id = re.search(
-            r"(?:video-|hd-porn/)([A-Za-z0-9]{5,12})",
-            video_url,
-            re.IGNORECASE,
-        ).group(1)
+        video_id = parse_id(video_url)
+
+        if not video_id:
+            await status.edit("❌ Invalid Eporner video link.")
+            return
 
         metadata = await fetch_meta(video_id)
 
-        available = {
-            get_resolution(stream.get("resolution", ""))
-            for stream in metadata.get("videos", [])
-        }
+        videos = metadata.get("videos", [])
+
+        available = set()
+
+        for video in videos:
+            resolution = get_resolution(video)
+
+            if resolution in (480, 720, 1080):
+                available.add(resolution)
+
+        if not available:
+            await status.edit(
+                "❌ No supported video qualities found."
+            )
+            return
 
         buttons = []
 
-        for quality in QUALITY_OPTIONS:
+        row = []
+
+        for quality in (480, 720, 1080):
+
             if quality in available:
-                buttons.append(
+
+                row.append(
                     Button.inline(
-                        f"🎬 {quality}P",
+                        f"{quality}P",
                         data=f"dl:{video_id}:{quality}".encode(),
                     )
                 )
 
-        if not buttons:
-            raise NoStreamsAvailableError(
-                "480P, 720P ya 1080P mein koi stream available nahi hai."
-            )
+        if row:
+            buttons.append(row)
 
-        keyboard = [buttons]
+        title = metadata.get("title", "Unknown")
 
-        await status_message.edit(
-            "🎬 **Select Video Quality**\n\n"
-            "Apni preferred quality choose karo:",
-            buttons=keyboard,
+        await status.edit(
+            f"🎬 **{title}**\n\n"
+            "👇 Select video quality:",
+            buttons=buttons,
         )
 
-    except Exception as exc:
-        logger.exception("Could not fetch video qualities.")
+    except Exception:
+        logger.exception("Video handler failed")
 
-        await status_message.edit(
-            f"❌ Could not load video qualities:\n{str(exc)[:500]}"
+        await status.edit(
+            "❌ Failed to fetch video information."
         )
 
 
-@bot_client.on(events.CallbackQuery)
+# --------------------------------------------------
+# QUALITY CALLBACK
+# --------------------------------------------------
+
+@bot_client.on(events.CallbackQuery(pattern=b"^dl:"))
 async def quality_callback(event):
-    if not is_authorized(event.sender_id):
+
+    if ALLOWED_USERS and event.sender_id not in ALLOWED_USERS:
         await event.answer(
             "You are not authorized.",
             alert=True,
@@ -237,29 +232,28 @@ async def quality_callback(event):
         return
 
     try:
-        data = event.data.decode("utf-8")
+        callback_data = event.data.decode("utf-8")
 
-        if not data.startswith("dl:"):
-            return
+        _, video_id, quality_text = callback_data.split(":")
 
-        _, video_id, resolution = data.split(":")
+        resolution = int(quality_text)
 
-        resolution = int(resolution)
-
-        if resolution not in QUALITY_OPTIONS:
+        if resolution not in (480, 720, 1080):
             await event.answer(
-                "Invalid quality selection.",
+                "Invalid quality.",
                 alert=True,
             )
             return
 
-        await event.answer(
-            f"{resolution}P selected!"
-        )
+        await event.answer("Quality selected!")
 
-        await event.edit(
+        # Callback message ko retrieve karo.
+        callback_message = await event.get_message()
+
+        await callback_message.edit(
             f"✅ Selected quality: {resolution}P\n"
-            "⏳ Preparing download..."
+            "⏳ Preparing download...",
+            buttons=None,
         )
 
         video_url = (
@@ -268,71 +262,61 @@ async def quality_callback(event):
 
         await process_video(
             bot_client=bot_client,
-            message=event.message,
+            message=callback_message,
             url=video_url,
             selected_resolution=resolution,
         )
 
     except Exception:
-        logger.exception("Quality callback failed.")
+        logger.exception("Quality callback failed")
 
         try:
             await event.answer(
-                "Something went wrong.",
+                "Download failed. Check bot logs.",
                 alert=True,
             )
         except Exception:
             pass
 
 
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+
 async def main():
-    logger.info("Starting Eporner Leech Bot...")
 
     validate_config()
-    await init_db()
 
-    health_server = await asyncio.start_server(
-        health_handler,
-        HOST,
-        PORT,
+    await bot_client.start(
+        bot_token=BOT_TOKEN,
     )
+
+    me = await bot_client.get_me()
 
     logger.info(
-        "Health server running at %s:%s",
-        HOST,
-        PORT,
+        "Telegram bot connected: @%s",
+        me.username,
     )
 
+    health_task = asyncio.create_task(
+        health_server()
+    )
+
+    logger.info("Bot is running.")
+
     try:
-        await bot_client.start(
-            bot_token=BOT_TOKEN,
-        )
-
-        me = await bot_client.get_me()
-
-        logger.info(
-            "Telegram bot connected: @%s",
-            me.username,
-        )
-
         await bot_client.run_until_disconnected()
 
     finally:
-        health_server.close()
-        await health_server.wait_closed()
+        health_task.cancel()
 
         await bot_client.disconnect()
 
-        logger.info("Bot shutdown complete.")
-
 
 if __name__ == "__main__":
+
     try:
         asyncio.run(main())
 
     except KeyboardInterrupt:
         logger.info("Bot stopped.")
-
-    except Exception:
-        logger.exception("Fatal startup error.")
-        sys.exit(1)
