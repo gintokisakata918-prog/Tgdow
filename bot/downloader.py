@@ -17,10 +17,26 @@ from bot.config import (
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
-# Parallel connections per file. Colab pe 16 theek hai.
-# Eporner 403/429 de to 8 kar do.
-ARIA2_CONNECTIONS = int(os.getenv("ARIA2_CONNECTIONS", "16"))
-ARIA2_SPLIT_MB = "1M"
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Parallel connections. 8 default — 16 pe Eporner ka CDN atak jaata hai.
+ARIA2_CONNECTIONS = max(1, _env_int("ARIA2_CONNECTIONS", 8))
+
+# Itne second tak 0 byte rahe to aria2 kill, single connection pe fallback.
+ARIA2_FIRST_BYTE_TIMEOUT = _env_int("ARIA2_FIRST_BYTE_TIMEOUT", 40)
+
+# Download chalu hone ke baad itne second speed 0 rahe to bhi kill.
+ARIA2_STALL_TIMEOUT = _env_int("ARIA2_STALL_TIMEOUT", 45)
+
+DISABLE_ARIA2 = os.getenv("DISABLE_ARIA2", "").lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 def human(size: int) -> str:
@@ -43,27 +59,49 @@ async def probe_size(
     url: str,
     headers: dict[str, str],
 ) -> int:
-    """Content-Length / Content-Range se total size nikaalo."""
+    """Total size nikaalo: HEAD -> Range probe -> plain headers."""
+
+    timeout = httpx.Timeout(20)
 
     try:
         async with httpx.AsyncClient(
-            headers={**headers, "Range": "bytes=0-0"},
-            timeout=httpx.Timeout(30),
+            headers=headers,
+            timeout=timeout,
             follow_redirects=True,
             trust_env=False,
         ) as client:
 
-            response = await client.get(url)
+            try:
+                head = await client.head(url)
+                length = int(head.headers.get("content-length", 0))
 
-        content_range = response.headers.get("content-range", "")
+                if length > 0:
+                    return length
 
-        match = re.search(r"/(\d+)\s*$", content_range)
+            except Exception:
+                pass
 
-        if match:
-            return int(match.group(1))
+            try:
+                probe = await client.get(
+                    url,
+                    headers={**headers, "Range": "bytes=0-0"},
+                )
 
-        if response.status_code == 200:
-            return int(response.headers.get("content-length", 0))
+                match = re.search(
+                    r"/(\d+)\s*$",
+                    probe.headers.get("content-range", ""),
+                )
+
+                if match:
+                    return int(match.group(1))
+
+                length = int(probe.headers.get("content-length", 0))
+
+                if probe.status_code == 200 and length > 0:
+                    return length
+
+            except Exception:
+                pass
 
     except Exception:
         pass
@@ -73,7 +111,6 @@ async def probe_size(
 
 async def watch_progress(
     path: Path,
-    process: asyncio.subprocess.Process,
     total: int,
     progress_callback: ProgressCallback | None,
     stop: asyncio.Event,
@@ -96,10 +133,55 @@ async def watch_progress(
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=2)
+            return
         except asyncio.TimeoutError:
             continue
 
-        break
+
+async def stall_guard(
+    process: asyncio.subprocess.Process,
+    path: Path,
+    stop: asyncio.Event,
+) -> str | None:
+    """0 byte pe atka ya beech me ruk gaya to aria2 kill karo."""
+
+    started = time.monotonic()
+    last_size = -1
+    last_change = started
+
+    while not stop.is_set():
+
+        await asyncio.sleep(2)
+
+        if stop.is_set() or process.returncode is not None:
+            return None
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+
+        now = time.monotonic()
+
+        if size != last_size:
+            last_size = size
+            last_change = now
+
+        if size == 0 and now - started > ARIA2_FIRST_BYTE_TIMEOUT:
+            process.kill()
+            return (
+                f"aria2c ne {ARIA2_FIRST_BYTE_TIMEOUT}s me koi byte "
+                f"nahi diya ({ARIA2_CONNECTIONS} connections)"
+            )
+
+        if size > 0 and now - last_change > ARIA2_STALL_TIMEOUT:
+            process.kill()
+            return (
+                f"aria2c {ARIA2_STALL_TIMEOUT}s se ruka hua tha "
+                f"({human(size)} pe)"
+            )
+
+    return None
 
 
 async def download_aria2(
@@ -108,7 +190,6 @@ async def download_aria2(
     headers: dict[str, str],
     progress_callback: ProgressCallback | None,
 ) -> Path:
-    """aria2c se multi-connection download (Range resume ke saath)."""
 
     total = await probe_size(url, headers)
 
@@ -120,12 +201,11 @@ async def download_aria2(
         "--file-allocation=none",
         f"--max-connection-per-server={ARIA2_CONNECTIONS}",
         f"--split={ARIA2_CONNECTIONS}",
-        f"--min-split-size={ARIA2_SPLIT_MB}",
+        "--min-split-size=1M",
         "--max-tries=5",
         "--retry-wait=3",
-        "--connect-timeout=30",
-        "--timeout=60",
-        "--lowest-speed-limit=10K",
+        "--connect-timeout=20",
+        "--timeout=30",
         "--summary-interval=0",
         "--console-log-level=warn",
         f"--user-agent={headers['User-Agent']}",
@@ -139,7 +219,7 @@ async def download_aria2(
 
     print(
         f"aria2c: {ARIA2_CONNECTIONS} connections -> "
-        f"{httpx.URL(url).host}"
+        f"{httpx.URL(url).host} (total={human(total) if total else 'unknown'})"
     )
 
     process = await asyncio.create_subprocess_exec(
@@ -153,11 +233,14 @@ async def download_aria2(
     watcher = asyncio.create_task(
         watch_progress(
             temporary_path,
-            process,
             total,
             progress_callback,
             stop,
         )
+    )
+
+    guard = asyncio.create_task(
+        stall_guard(process, temporary_path, stop)
     )
 
     try:
@@ -166,9 +249,16 @@ async def download_aria2(
         stop.set()
         watcher.cancel()
 
+    reason = await guard
+
     if process.returncode != 0:
-        detail = stderr.decode(errors="ignore").strip().splitlines()
-        detail = " | ".join(detail[-3:])[:400]
+
+        if reason:
+            raise RuntimeError(reason)
+
+        detail = " | ".join(
+            stderr.decode(errors="ignore").strip().splitlines()[-3:]
+        )[:400]
 
         raise RuntimeError(
             f"aria2c failed (exit {process.returncode}): "
@@ -184,7 +274,6 @@ async def download_httpx(
     headers: dict[str, str],
     progress_callback: ProgressCallback | None,
 ) -> Path:
-    """Fallback: single connection, Range resume, descriptive errors."""
 
     timeout = httpx.Timeout(
         connect=60,
@@ -237,22 +326,16 @@ async def download_httpx(
 
                     if response.status_code == 206:
 
-                        content_range = response.headers.get(
-                            "content-range", ""
-                        )
-
                         match = re.search(
                             r"/(\d+)\s*$",
-                            content_range,
+                            response.headers.get("content-range", ""),
                         )
 
                         total = (
                             int(match.group(1))
                             if match
                             else resume_from + int(
-                                response.headers.get(
-                                    "content-length", 0
-                                )
+                                response.headers.get("content-length", 0)
                             )
                         )
 
@@ -261,9 +344,7 @@ async def download_httpx(
                     else:
 
                         total = int(
-                            response.headers.get(
-                                "content-length", 0
-                            )
+                            response.headers.get("content-length", 0)
                         )
 
                         downloaded = 0
@@ -296,9 +377,7 @@ async def download_httpx(
                                 last_update = now
 
             if downloaded == 0:
-                raise RuntimeError(
-                    "Downloaded file is empty."
-                )
+                raise RuntimeError("Downloaded file is empty.")
 
             print(
                 f"Download completed: {human(downloaded)} "
@@ -364,7 +443,7 @@ async def download(
         "Accept": "*/*",
     }
 
-    use_aria2 = aria2_available()
+    use_aria2 = aria2_available() and not DISABLE_ARIA2
 
     try:
         if use_aria2:
@@ -381,11 +460,12 @@ async def download(
 
                 print(
                     f"aria2c path failed "
-                    f"({type(error).__name__}: {error}), "
-                    f"falling back to single connection"
+                    f"({type(error).__name__}: {error}) -> "
+                    f"single connection"
                 )
 
                 temporary_path.unlink(missing_ok=True)
+                Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
 
                 await download_httpx(
                     url,
@@ -397,8 +477,8 @@ async def download(
         else:
 
             print(
-                "aria2c not installed, using single connection "
-                "(apt install aria2 for parallel download)"
+                "aria2c off (DISABLE_ARIA2 set ya install nahi hai), "
+                "single connection"
             )
 
             await download_httpx(
@@ -412,6 +492,8 @@ async def download(
             raise RuntimeError("Downloaded file is empty.")
 
         os.replace(temporary_path, output_path)
+
+        Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
 
         return output_path
 
@@ -428,9 +510,7 @@ async def download_thumbnail(
 ) -> Path:
 
     if not url.startswith("https://"):
-        raise ValueError(
-            "Invalid thumbnail URL."
-        )
+        raise ValueError("Invalid thumbnail URL.")
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -454,17 +534,13 @@ async def download_thumbnail(
             response.raise_for_status()
 
             if not response.content:
-                raise RuntimeError(
-                    "Thumbnail is empty."
-                )
+                raise RuntimeError("Thumbnail is empty.")
 
-            output_path.write_bytes(
-                response.content
-            )
+            output_path.write_bytes(response.content)
 
         return output_path
 
     except Exception:
         output_path.unlink(missing_ok=True)
         raise
-    
+                               
