@@ -123,7 +123,6 @@ async def fetch_metadata(
     if data.get("error"):
         raise VideoNotFoundError(str(data["error"]))
 
-    # Support API responses containing a videos list.
     if isinstance(data.get("videos"), list):
         videos = data["videos"]
 
@@ -152,29 +151,26 @@ async def fetch_player_streams(
     video_id: str,
 ) -> list[dict[str, Any]]:
 
-    page_url = (
-        f"https://www.eporner.com/video-{video_id}/"
-    )
+    page_url = f"https://www.eporner.com/embed/{video_id}/"
 
     try:
         response = await client.get(page_url)
         response.raise_for_status()
-
         html = response.text
 
     except httpx.HTTPError as exc:
         raise EpornerError(
-            f"Could not open Eporner video page: {exc}"
+            f"Could not open Eporner embed page: {exc}"
         ) from exc
 
     hash_match = re.search(
-        r'hash\s*[:=]\s*["\']([0-9a-fA-F]{32})',
+        r'EP\.video\.player\.hash\s*=\s*["\']([0-9a-fA-F]{32})',
         html,
     )
 
     if not hash_match:
         raise NoStreamsAvailableError(
-            "Player hash not found on video page."
+            "Player hash not found on embed page."
         )
 
     player_hash = calculate_hash(hash_match.group(1))
@@ -186,9 +182,8 @@ async def fetch_player_streams(
         "fallback": "false",
     }
 
-    xhr_url = (
-        f"https://www.eporner.com/xhr/video/{video_id}"
-    )
+    xhr_url = f"https://www.eporner.com/xhr/video/{video_id}"
+    streams = []
 
     try:
         response = await client.get(
@@ -203,13 +198,11 @@ async def fetch_player_streams(
         response.raise_for_status()
         player_data = response.json()
 
-    except (httpx.HTTPError, ValueError) as exc:
-        raise EpornerError(
-            f"Player stream request failed: {exc}"
-        ) from exc
+    except (httpx.HTTPError, ValueError):
+        player_data = {}
 
     if not isinstance(player_data, dict):
-        raise EpornerError("Invalid player response.")
+        player_data = {}
 
     if player_data.get("available") is False:
         raise VideoNotFoundError(
@@ -221,53 +214,67 @@ async def fetch_player_streams(
 
     sources = player_data.get("sources", {})
 
-    if not isinstance(sources, dict):
-        raise NoStreamsAvailableError(
-            "No video sources found."
+    if isinstance(sources, dict):
+        for source_type, formats in sources.items():
+
+            if source_type == "hls":
+                continue
+
+            if not isinstance(formats, dict):
+                continue
+
+            for format_id, format_data in formats.items():
+
+                if not isinstance(format_data, dict):
+                    continue
+
+                source_url = format_data.get("src")
+
+                if not isinstance(source_url, str):
+                    continue
+
+                if not source_url.startswith("https://"):
+                    continue
+
+                resolution_match = re.search(
+                    r"(\d{3,4})p",
+                    str(format_id),
+                    re.IGNORECASE,
+                )
+
+                if not resolution_match:
+                    continue
+
+                resolution = int(resolution_match.group(1))
+
+                streams.append({
+                    "resolution": f"{resolution}p",
+                    "url": source_url,
+                    "type": source_type,
+                })
+
+    if not streams:
+
+        content_match = re.search(
+            r'"contentUrl"\s*:\s*"([^"]+)"',
+            html,
         )
 
-    streams = []
+        height_match = re.search(
+            r'"height"\s*:\s*"?(\d+)',
+            html,
+        )
 
-    for source_type, formats in sources.items():
-
-        if not isinstance(formats, dict):
-            continue
-
-        # Direct MP4 sources only.
-        if source_type == "hls":
-            continue
-
-        for format_id, format_data in formats.items():
-
-            if not isinstance(format_data, dict):
-                continue
-
-            source_url = format_data.get("src")
-
-            if not isinstance(source_url, str):
-                continue
-
-            if not source_url.startswith("https://"):
-                continue
-
-            resolution_match = re.search(
-                r"(\d{3,4})p",
-                str(format_id),
-                re.IGNORECASE,
-            )
-
-            if not resolution_match:
-                continue
-
-            resolution = int(resolution_match.group(1))
-
+        if content_match:
             streams.append({
-                "resolution": f"{resolution}p",
-                "url": source_url,
-                "type": source_type,
+                "resolution": (
+                    f"{height_match.group(1)}p"
+                    if height_match else "Unknown"
+                ),
+                "url": content_match.group(1),
+                "type": "mp4",
             })
 
-    # Remove duplicate resolutions and URLs.
     unique_streams = {}
 
     for stream in streams:
@@ -277,6 +284,11 @@ async def fetch_player_streams(
                 stream["url"],
             )
         ] = stream
+
+    if not unique_streams:
+        raise NoStreamsAvailableError(
+            "No video streams found."
+        )
 
     return list(unique_streams.values())
 
