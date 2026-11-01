@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -13,6 +14,8 @@ from bot.config import (
 )
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
+
+MAX_RETRIES = 3
 
 
 def human(size: int) -> str:
@@ -50,78 +53,111 @@ async def download(
         "Connection": "keep-alive",
     }
 
-    downloaded = 0
-    last_update = 0
-    start_time = time.monotonic()
+    timeout = httpx.Timeout(
+        connect=60,
+        read=180,
+        write=60,
+        pool=60,
+    )
 
-    try:
-        timeout = httpx.Timeout(
-            connect=30,
-            read=120,
-            write=30,
-            pool=30,
-        )
+    retry_errors = (
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+    )
 
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=timeout,
-            follow_redirects=True,
-        ) as client:
+    for attempt in range(1, MAX_RETRIES + 1):
 
-            async with client.stream("GET", url) as response:
+        downloaded = 0
+        total = 0
+        last_update = 0
+        start_time = time.monotonic()
 
-                response.raise_for_status()
+        try:
+            temporary_path.unlink(missing_ok=True)
 
-                total = int(
-                    response.headers.get("content-length", 0)
-                )
+            async with httpx.AsyncClient(
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=True,
+            ) as client:
 
-                with open(temporary_path, "wb") as file:
+                async with client.stream("GET", url) as response:
 
-                    async for chunk in response.aiter_bytes(
-                        chunk_size=CHUNK_SIZE
-                    ):
+                    response.raise_for_status()
 
-                        if not chunk:
-                            continue
+                    total = int(
+                        response.headers.get("content-length", 0)
+                    )
 
-                        file.write(chunk)
-                        downloaded += len(chunk)
+                    with open(temporary_path, "wb") as file:
 
-                        current_time = time.monotonic()
-
-                        if (
-                            progress_callback
-                            and current_time - last_update >= 2
+                        async for chunk in response.aiter_bytes(
+                            chunk_size=CHUNK_SIZE
                         ):
 
-                            await progress_callback(
-                                downloaded,
-                                total,
-                            )
+                            if not chunk:
+                                continue
 
-                            last_update = current_time
+                            file.write(chunk)
+                            downloaded += len(chunk)
 
-        if downloaded == 0:
-            raise RuntimeError("Downloaded file is empty.")
+                            current_time = time.monotonic()
 
-        os.replace(
-            temporary_path,
-            output_path,
-        )
+                            if (
+                                progress_callback
+                                and current_time - last_update >= 2
+                            ):
 
-        if progress_callback:
-            await progress_callback(
-                downloaded,
-                total,
+                                await progress_callback(
+                                    downloaded,
+                                    total,
+                                )
+
+                                last_update = current_time
+
+            if downloaded == 0:
+                raise RuntimeError("Downloaded file is empty.")
+
+            os.replace(
+                temporary_path,
+                output_path,
             )
 
-        return output_path
+            if progress_callback:
+                await progress_callback(
+                    downloaded,
+                    total or downloaded,
+                )
 
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        raise
+            return output_path
+
+        except retry_errors:
+
+            temporary_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+
+            if attempt >= MAX_RETRIES:
+                raise
+
+            wait_time = attempt * 3
+
+            print(
+                f"Download connection failed. "
+                f"Retry {attempt}/{MAX_RETRIES - 1} "
+                f"in {wait_time} seconds..."
+            )
+
+            await asyncio.sleep(wait_time)
+
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+            raise
+
+    raise RuntimeError("Download failed after all retries.")
 
 
 async def download_thumbnail(
