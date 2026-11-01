@@ -34,6 +34,7 @@ from bot.eporner import (
     parse_id,
     fetch_meta,
     pick_source,
+    build_candidates,
     get_title,
     get_duration,
     get_keywords,
@@ -426,8 +427,13 @@ async def process_video(
                 download_last_update,
             )
 
+        candidates = build_candidates(metadata, video_id)
+
+        if stream_url and stream_url not in candidates:
+            candidates.insert(0, stream_url)
+
         video_path = await download(
-            stream_url,
+            candidates,
             filename,
             progress_callback=download_progress,
         )
@@ -610,10 +616,13 @@ async def process_video(
             "Video processing failed"
         )
 
+        detail = f"{type(error).__name__}: {error}".strip(": ")
+
         try:
 
             await message.edit(
-                f"❌ Failed:\n{str(error)[:700]}"
+                f"❌ Failed:\n"
+                f"{detail[:700] or 'no details — check Colab logs'}"
             )
 
         except Exception:
@@ -637,4 +646,5 @@ async def process_video(
                 except Exception:
                     logger.exception(
                         "File cleanup failed"
-            )
+                )
+    
