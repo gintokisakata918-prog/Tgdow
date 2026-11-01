@@ -60,7 +60,6 @@ def make_hashtags(keywords):
     tags = []
 
     for keyword in keywords or []:
-
         keyword = re.sub(
             r"[^a-zA-Z0-9_]",
             "",
@@ -105,7 +104,6 @@ def make_thumbnail(source, output):
             quality = 85
 
             while quality >= 30:
-
                 image.save(
                     output,
                     "JPEG",
@@ -191,7 +189,6 @@ async def show_progress(
     current_mb = human_mb(current)
 
     if total > 0:
-
         percentage = current / total * 100
         total_mb = human_mb(total)
 
@@ -203,7 +200,6 @@ async def show_progress(
         )
 
     else:
-
         text = (
             f"{heading}\n\n"
             f"📦 Transferred: {current_mb}\n"
@@ -238,7 +234,6 @@ async def process_video(
         return
 
     if await seen(video_id):
-
         await message.edit(
             "⚠️ This video has already been downloaded."
         )
@@ -370,7 +365,6 @@ async def process_video(
         if thumbnail_url:
 
             try:
-
                 raw_thumbnail = await download_thumbnail(
                     thumbnail_url,
                     f"{video_id}_raw.jpg",
@@ -388,7 +382,6 @@ async def process_video(
                 raw_thumbnail.unlink(missing_ok=True)
 
             except Exception:
-
                 logger.exception(
                     "Thumbnail download failed"
                 )
@@ -444,13 +437,12 @@ async def process_video(
                 upload_last_update,
             )
 
-        # Upload with optimized chunks and workers
+        # Upload file using Telethon 1.42.0
 
         uploaded_file = await bot_client.upload_file(
             str(video_path),
             part_size_kb=512,
             file_name=f"{video_id}.mp4",
-            workers=4,
             progress_callback=upload_progress,
         )
 
@@ -498,7 +490,6 @@ async def process_video(
         )
 
         try:
-
             await message.edit(
                 f"❌ Failed:\n{str(error)[:700]}"
             )
@@ -523,4 +514,4 @@ async def process_video(
                 except Exception:
                     logger.exception(
                         "File cleanup failed"
-            )
+        )
