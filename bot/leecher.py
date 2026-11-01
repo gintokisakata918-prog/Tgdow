@@ -1,22 +1,15 @@
 import asyncio
 import logging
 import re
-import time
-import json
-
+import shutil
 from pathlib import Path
 
 from PIL import Image
-
-from telethon.tl.types import (
-    DocumentAttributeVideo,
-    DocumentAttributeFilename,
-)
+from telethon.tl.types import DocumentAttributeVideo
 
 from bot.config import (
-    DOWNLOAD_DIR,
-    COMPRESS_ABOVE_MB,
     CLEAN,
+    COMPRESS_ABOVE_MB,
     FFMPEG_BIN,
     FFMPEG_VIDEO_CODEC,
     FFMPEG_AUDIO_CODEC,
@@ -24,617 +17,428 @@ from bot.config import (
     FFMPEG_AUDIO_BITRATE,
     FFMPEG_MAX_WIDTH,
     FFMPEG_EXTRA_ARGS,
-    CLEAN_CAPTION_TEMPLATE,
-    CAPTION_TEMPLATE,
+    MAX_RES,
 )
-
 from bot.database import seen, mark
-
+from bot.downloader import download, download_thumbnail, human
 from bot.eporner import (
-    parse_id,
     fetch_meta,
+    parse_id,
     pick_source,
-    get_title,
     get_duration,
     get_keywords,
     get_thumbnail,
+    get_title,
 )
-
-from bot.downloader import (
-    download,
-    download_thumbnail,
-)
-
 
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
+def clean_title(title: str) -> str:
+    title = re.sub(
+        r"https?://\S+|www\.\S+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
 
-def human_mb(value):
-    return f"{value / (1024 * 1024):.2f} MB"
+    title = re.sub(
+        r"\beporner\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+
+    title = re.sub(r"\s+", " ", title)
+
+    return title.strip(" -_|")
 
 
-def clean_text(text):
-    text = re.sub(r"https?://\S+", "", str(text))
-    text = re.sub(r"eporner", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def make_slug(title: str) -> str:
+    if CLEAN:
+        title = clean_title(title)
+
+    slug = re.sub(
+        r"[^a-zA-Z0-9]+",
+        "-",
+        title.lower(),
+    )
+
+    return slug.strip("-")[:70] or "video"
 
 
-def make_hashtags(keywords):
-    tags = []
+def make_caption(
+    title: str,
+    keywords: list[str],
+) -> str:
 
-    for keyword in keywords or []:
+    hashtags = []
 
-        keyword = re.sub(
-            r"[^a-zA-Z0-9_]",
+    for keyword in keywords:
+        tag = re.sub(
+            r"[^a-zA-Z0-9]",
             "",
-            str(keyword).replace(" ", "_"),
+            keyword.replace(" ", ""),
         )
 
-        if keyword:
-            tags.append("#" + keyword)
+        if tag:
+            hashtags.append(f"#{tag}")
 
-        if len(tags) >= 8:
+        if len(hashtags) >= 8:
             break
 
-    return " ".join(tags)
+    caption = title
 
-
-def make_caption(title, keywords):
-    if CLEAN:
-        title = clean_text(title)
-        template = CLEAN_CAPTION_TEMPLATE
-    else:
-        template = CAPTION_TEMPLATE
-
-    hashtags = make_hashtags(keywords)
-
-    caption = template.format(
-        title=title,
-        hashtags=hashtags,
-    )
+    if hashtags:
+        caption += "\n\n" + " ".join(hashtags)
 
     return caption[:1024]
 
 
-def make_thumbnail(source, output):
+async def run_ffmpeg(arguments: list[str]) -> None:
+    process = await asyncio.create_subprocess_exec(
+        FFMPEG_BIN,
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        error = stderr.decode(
+            "utf-8",
+            errors="ignore",
+        )[-1500:]
+
+        raise RuntimeError(f"FFmpeg failed: {error}")
+
+
+async def compress_video(input_path: Path) -> Path:
+    output_path = input_path.with_name(
+        f"{input_path.stem}_compressed.mp4"
+    )
+
+    arguments = [
+        "-y",
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-c:v", FFMPEG_VIDEO_CODEC,
+        "-preset", "medium",
+        "-crf", str(FFMPEG_CRF),
+        "-vf", f"scale='min({FFMPEG_MAX_WIDTH},iw)':-2",
+        "-c:a", FFMPEG_AUDIO_CODEC,
+        "-b:a", FFMPEG_AUDIO_BITRATE,
+        *FFMPEG_EXTRA_ARGS,
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
     try:
-        with Image.open(source) as image:
+        await run_ffmpeg(arguments)
 
-            image = image.convert("RGB")
-            image.thumbnail((320, 320))
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("Compressed video is empty.")
 
-            quality = 85
-
-            while quality >= 30:
-
-                image.save(
-                    output,
-                    "JPEG",
-                    quality=quality,
-                    optimize=True,
-                )
-
-                if Path(output).stat().st_size <= 190 * 1024:
-                    break
-
-                quality -= 10
-
-        return Path(output)
+        return output_path
 
     except Exception:
-        logger.exception("Thumbnail processing failed")
-        return None
+        output_path.unlink(missing_ok=True)
+        raise
 
 
-async def get_video_info(path):
+async def strip_metadata(input_path: Path) -> Path:
+    output_path = input_path.with_name(
+        f"{input_path.stem}_clean.mp4"
+    )
+
+    arguments = [
+        "-y",
+        "-i", str(input_path),
+        "-map", "0",
+        "-c", "copy",
+        *FFMPEG_EXTRA_ARGS,
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    try:
+        await run_ffmpeg(arguments)
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("Cleaned video is empty.")
+
+        return output_path
+
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
+def prepare_thumbnail(input_path: Path) -> Path:
+    output_path = input_path.with_suffix(".jpg")
+
+    with Image.open(input_path) as image:
+        image = image.convert("RGB")
+        image.thumbnail((320, 320))
+
+        quality = 85
+
+        while quality >= 35:
+            image.save(
+                output_path,
+                "JPEG",
+                quality=quality,
+                optimize=True,
+            )
+
+            if output_path.stat().st_size <= 190 * 1024:
+                return output_path
+
+            quality -= 10
+
+    output_path.unlink(missing_ok=True)
+
+    raise RuntimeError("Could not optimize thumbnail.")
+
+
+async def get_video_dimensions(
+    video_path: Path,
+) -> tuple[int, int]:
+
+    ffprobe = shutil.which("ffprobe")
+
+    if not ffprobe:
+        return 1280, 720
 
     process = await asyncio.create_subprocess_exec(
-        "ffprobe",
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        str(path),
+        ffprobe,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=s=x:p=0",
+        str(video_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     stdout, _ = await process.communicate()
 
-    if process.returncode != 0:
-        return 0, 1280, 720
-
-    data = json.loads(stdout)
-
-    duration = int(
-        float(data.get("format", {}).get("duration", 0))
-    )
-
-    width = 1280
-    height = 720
-
-    for stream in data.get("streams", []):
-
-        if stream.get("codec_type") == "video":
-            width = int(stream.get("width", 1280))
-            height = int(stream.get("height", 720))
-            break
-
-    return duration, width, height
-
-
-# --------------------------------------------------
-# FFMPEG
-# --------------------------------------------------
-
-async def compress_video(input_path, output_path):
-
-    command = [
-        FFMPEG_BIN,
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-vf",
-        f"scale='min({FFMPEG_MAX_WIDTH},iw)':-2",
-        "-c:v",
-        FFMPEG_VIDEO_CODEC,
-        "-preset",
-        "veryfast",
-        "-crf",
-        str(FFMPEG_CRF),
-        "-c:a",
-        FFMPEG_AUDIO_CODEC,
-        "-b:a",
-        FFMPEG_AUDIO_BITRATE,
-        *FFMPEG_EXTRA_ARGS,
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    _, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            stderr.decode(errors="ignore")[-2000:]
-        )
-
-    return Path(output_path)
-
-
-async def strip_metadata(input_path, output_path):
-
-    command = [
-        FFMPEG_BIN,
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0",
-        "-map_metadata",
-        "-1",
-        "-c",
-        "copy",
-        str(output_path),
-    ]
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    _, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            stderr.decode(errors="ignore")[-2000:]
-        )
-
-    return Path(output_path)
-
-
-# --------------------------------------------------
-# PROGRESS DISPLAY
-# --------------------------------------------------
-
-async def show_progress(
-    message,
-    heading,
-    current,
-    total,
-    start_time,
-    last_update,
-    force=False,
-):
-
-    now = time.monotonic()
-
-    if not force and now - last_update < 2:
-        return now
-
-    elapsed = max(now - start_time, 0.1)
-
-    speed = current / elapsed
-
-    speed_mb = speed / (1024 * 1024)
-    current_mb = human_mb(current)
-
-    if total > 0:
-
-        percentage = current / total * 100
-        total_mb = human_mb(total)
-
-        text = (
-            f"{heading}\n\n"
-            f"📊 Progress: {percentage:.1f}%\n"
-            f"📦 Transferred: {current_mb} / {total_mb}\n"
-            f"⚡ Speed: {speed_mb:.2f} MB/s"
-        )
-
-    else:
-
-        text = (
-            f"{heading}\n\n"
-            f"📦 Transferred: {current_mb}\n"
-            f"⚡ Speed: {speed_mb:.2f} MB/s\n"
-            f"ℹ️ Total size: Unknown"
-        )
-
     try:
-        await message.edit(text)
-    except Exception:
-        pass
+        width, height = stdout.decode().strip().split("x")
+        return int(width), int(height)
 
-    return now
+    except (ValueError, TypeError):
+        return 1280, 720
 
-
-# --------------------------------------------------
-# MAIN VIDEO PROCESS
-# --------------------------------------------------
 
 async def process_video(
     bot_client,
     message,
     url: str,
     selected_resolution: int | None = None,
-):
+) -> None:
 
     video_id = parse_id(url)
 
-    if not video_id:
-        await message.edit("❌ Invalid video URL.")
-        return
-
     if await seen(video_id):
-
-        await message.edit(
-            "⚠️ This video has already been downloaded."
+        await message.reply(
+            "ℹ️ This video has already been downloaded."
         )
         return
 
-    video_path = None
-    thumbnail_path = None
-    processed_path = None
+    if selected_resolution is None:
+        selected_resolution = MAX_RES
+
+    if selected_resolution not in (480, 720, 1080):
+        await message.reply("❌ Invalid video quality.")
+        return
+
+    progress_message = await message.reply(
+        "🔎 Fetching video information..."
+    )
+
+    temporary_files = []
 
     try:
-
-        # Fetch metadata
-
-        await message.edit(
-            "🔎 Fetching video information..."
-        )
-
         metadata = await fetch_meta(video_id)
 
         title = get_title(metadata)
-        duration = get_duration(metadata)
-        keywords = get_keywords(metadata)
-
-        # Select exact quality
+        display_title = clean_title(title) if CLEAN else title
 
         source = pick_source(
             metadata,
-            max_res=selected_resolution or 1080,
+            max_res=selected_resolution,
         )
 
-        if not source:
-            raise RuntimeError("No video stream available.")
+        actual_resolution = int(
+            re.search(
+                r"\d+",
+                source["resolution"],
+            ).group()
+        )
 
-        if isinstance(source, dict):
-
-            stream_url = (
-                source.get("url")
-                or source.get("src")
+        if actual_resolution != selected_resolution:
+            raise RuntimeError(
+                f"Selected {selected_resolution}P stream is unavailable."
             )
 
-            resolution = (
-                source.get("resolution")
-                or source.get("quality")
+        video_url = source["url"]
+
+        duration = get_duration(metadata)
+        keywords = get_keywords(metadata)
+
+        filename = (
+            f"{make_slug(title)}_{video_id}.mp4"
+        )
+
+        await progress_message.edit(
+            f"📥 Downloading {selected_resolution}P..."
+        )
+
+        async def update_progress(current: int, total: int):
+            percent = int(current * 100 / total)
+
+            await progress_message.edit(
+                f"📥 Downloading {selected_resolution}P: {percent}%\n"
+                f"📦 {human(current)} / {human(total)}"
             )
 
-        elif isinstance(source, (tuple, list)):
-
-            stream_url = source[0]
-            resolution = source[1] if len(source) > 1 else None
-
-        else:
-
-            stream_url = source
-            resolution = None
-
-        if not stream_url:
-            raise RuntimeError("Stream URL not found.")
-
-        if selected_resolution:
-
-            if resolution:
-
-                resolution_match = re.search(
-                    r"(\d{3,4})",
-                    str(resolution),
-                )
-
-                if (
-                    resolution_match
-                    and int(resolution_match.group(1))
-                    != selected_resolution
-                ):
-                    raise RuntimeError(
-                        "Selected quality does not match stream."
-                    )
-
-        # Download video
-
-        filename = f"{video_id}.mp4"
-
-        await message.edit(
-            f"📥 Downloading {selected_resolution or 1080}P\n\n"
-            "Preparing download..."
+        downloaded_path = await download(
+            url=video_url,
+            filename=filename,
+            progress_callback=update_progress,
         )
 
-        download_start = time.monotonic()
-        download_last_update = 0
+        temporary_files.append(downloaded_path)
 
-        async def download_progress(current, total):
-
-            nonlocal download_last_update
-
-            download_last_update = await show_progress(
-                message,
-                f"📥 Downloading {selected_resolution or 1080}P",
-                current,
-                total,
-                download_start,
-                download_last_update,
-            )
-
-        video_path = await download(
-            stream_url,
-            filename,
-            progress_callback=download_progress,
-        )
-
-        await show_progress(
-            message,
-            f"📥 Downloading {selected_resolution or 1080}P",
-            video_path.stat().st_size,
-            video_path.stat().st_size,
-            download_start,
-            download_last_update,
-            force=True,
-        )
-
-        # Compression / metadata cleaning
+        final_path = downloaded_path
 
         file_size_mb = (
-            video_path.stat().st_size / (1024 * 1024)
+            downloaded_path.stat().st_size / (1024 * 1024)
         )
 
         if file_size_mb > COMPRESS_ABOVE_MB:
 
-            await message.edit(
-                "⚙️ Compressing video...\n"
-                "Please wait."
+            await progress_message.edit(
+                "🗜 Compressing video...\n"
+                f"Original size: {human(downloaded_path.stat().st_size)}"
             )
 
-            processed_path = DOWNLOAD_DIR / (
-                f"{video_id}_compressed.mp4"
+            compressed_path = await compress_video(
+                downloaded_path
             )
 
-            await compress_video(
-                video_path,
-                processed_path,
-            )
-
-            video_path.unlink(missing_ok=True)
-            video_path = processed_path
+            temporary_files.append(compressed_path)
+            final_path = compressed_path
 
         elif CLEAN:
 
-            await message.edit(
-                "🧹 Cleaning video metadata..."
+            await progress_message.edit(
+                "🧹 Removing video metadata..."
             )
 
-            processed_path = DOWNLOAD_DIR / (
-                f"{video_id}_clean.mp4"
+            clean_path = await strip_metadata(
+                downloaded_path
             )
 
-            await strip_metadata(
-                video_path,
-                processed_path,
-            )
-
-            video_path.unlink(missing_ok=True)
-            video_path = processed_path
-
-        # Thumbnail
+            temporary_files.append(clean_path)
+            final_path = clean_path
 
         thumbnail_url = get_thumbnail(metadata)
+        prepared_thumbnail = None
 
         if thumbnail_url:
-
             try:
-
-                raw_thumbnail = await download_thumbnail(
+                thumbnail_path = await download_thumbnail(
                     thumbnail_url,
-                    f"{video_id}_raw.jpg",
+                    f"{video_id}_thumb",
                 )
 
-                thumbnail_path = DOWNLOAD_DIR / (
-                    f"{video_id}_thumb.jpg"
+                temporary_files.append(thumbnail_path)
+
+                prepared_thumbnail = prepare_thumbnail(
+                    thumbnail_path
                 )
 
-                make_thumbnail(
-                    raw_thumbnail,
-                    thumbnail_path,
-                )
-
-                raw_thumbnail.unlink(missing_ok=True)
+                temporary_files.append(prepared_thumbnail)
 
             except Exception:
-
-                logger.exception(
-                    "Thumbnail download failed"
+                logger.warning(
+                    "Thumbnail preparation failed.",
+                    exc_info=True,
                 )
 
-                thumbnail_path = None
-
-        # Prepare Telegram attributes
-
-        actual_duration, width, height = await get_video_info(
-            video_path
+        width, height = await get_video_dimensions(
+            final_path
         )
 
-        if not actual_duration:
-            actual_duration = int(duration or 0)
-
-        attributes = [
-            DocumentAttributeVideo(
-                duration=actual_duration,
-                w=width,
-                h=height,
-                supports_streaming=True,
-            ),
-            DocumentAttributeFilename(
-                f"{video_id}.mp4"
-            ),
-        ]
-
         caption = make_caption(
-            title,
+            display_title,
             keywords,
         )
 
-        # Telegram upload progress
-
-        await message.edit(
-            f"📤 Uploading {selected_resolution or 1080}P video...\n"
-            "Preparing upload..."
-        )
-
-        upload_start = time.monotonic()
-        upload_last_update = 0
-
-        async def upload_progress(current, total):
-
-            nonlocal upload_last_update
-
-            upload_last_update = await show_progress(
-                message,
-                f"📤 Uploading {selected_resolution or 1080}P video",
-                current,
-                total,
-                upload_start,
-                upload_last_update,
+        attributes = [
+            DocumentAttributeVideo(
+                duration=duration,
+                w=width,
+                h=height,
+                supports_streaming=True,
             )
+        ]
 
-        # Send video to same chat
+        await progress_message.edit(
+            f"📤 Uploading {selected_resolution}P video..."
+        )
 
         sent_message = await bot_client.send_file(
             entity=message.chat_id,
-            file=str(video_path),
+            file=str(final_path),
             caption=caption,
             thumb=(
-                str(thumbnail_path)
-                if thumbnail_path and thumbnail_path.exists()
+                str(prepared_thumbnail)
+                if prepared_thumbnail
                 else None
             ),
             attributes=attributes,
             supports_streaming=True,
             reply_to=message.id,
-            progress_callback=upload_progress,
         )
-
-        await show_progress(
-            message,
-            f"📤 Uploading {selected_resolution or 1080}P video",
-            video_path.stat().st_size,
-            video_path.stat().st_size,
-            upload_start,
-            upload_last_update,
-            force=True,
-        )
-
-        # Save database record
 
         await mark(
             video_id,
             sent_message.id,
         )
 
-        await message.edit(
-            "✅ Video uploaded successfully!"
+        await progress_message.delete()
+
+        logger.info(
+            "Video %s sent in %sP to chat %s",
+            video_id,
+            selected_resolution,
+            message.chat_id,
         )
 
-    except Exception as error:
-
+    except Exception as exc:
         logger.exception(
-            "Video processing failed"
+            "Failed to process video %s",
+            video_id,
         )
 
         try:
-
-            await message.edit(
-                f"❌ Failed:\n{str(error)[:700]}"
+            await progress_message.edit(
+                f"❌ Download failed:\n{str(exc)[:700]}"
             )
-
         except Exception:
             pass
 
     finally:
-
-        # Cleanup temporary files
-
-        for path in (
-            video_path,
-            thumbnail_path,
-            processed_path,
-        ):
-
-            if path:
-
-                try:
-                    Path(path).unlink(missing_ok=True)
-
-                except Exception:
-                    logger.exception(
-                        "File cleanup failed"
-                    )
+        for path in temporary_files:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                logger.warning(
+                    "Could not remove temporary file: %s",
+                    path,
+                )
