@@ -25,14 +25,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Parallel connections. 8 default — 16 pe Eporner ka CDN atak jaata hai.
 ARIA2_CONNECTIONS = max(1, _env_int("ARIA2_CONNECTIONS", 8))
-
-# Itne second tak 0 byte rahe to aria2 kill, single connection pe fallback.
-ARIA2_FIRST_BYTE_TIMEOUT = _env_int("ARIA2_FIRST_BYTE_TIMEOUT", 40)
-
-# Download chalu hone ke baad itne second speed 0 rahe to bhi kill.
+ARIA2_FIRST_BYTE_TIMEOUT = _env_int("ARIA2_FIRST_BYTE_TIMEOUT", 25)
 ARIA2_STALL_TIMEOUT = _env_int("ARIA2_STALL_TIMEOUT", 45)
+CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT", 10)
 
 DISABLE_ARIA2 = os.getenv("DISABLE_ARIA2", "").lower() in {
     "1", "true", "yes", "on",
@@ -59,9 +55,13 @@ async def probe_size(
     url: str,
     headers: dict[str, str],
 ) -> int:
-    """Total size nikaalo: HEAD -> Range probe -> plain headers."""
 
-    timeout = httpx.Timeout(20)
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT,
+        read=20,
+        write=20,
+        pool=20,
+    )
 
     try:
         async with httpx.AsyncClient(
@@ -70,16 +70,6 @@ async def probe_size(
             follow_redirects=True,
             trust_env=False,
         ) as client:
-
-            try:
-                head = await client.head(url)
-                length = int(head.headers.get("content-length", 0))
-
-                if length > 0:
-                    return length
-
-            except Exception:
-                pass
 
             try:
                 probe = await client.get(
@@ -143,7 +133,6 @@ async def stall_guard(
     path: Path,
     stop: asyncio.Event,
 ) -> str | None:
-    """0 byte pe atka ya beech me ruk gaya to aria2 kill karo."""
 
     started = time.monotonic()
     last_size = -1
@@ -199,12 +188,13 @@ async def download_aria2(
         "--allow-overwrite=true",
         "--auto-file-renaming=false",
         "--file-allocation=none",
+        "--disable-ipv6=true",
         f"--max-connection-per-server={ARIA2_CONNECTIONS}",
         f"--split={ARIA2_CONNECTIONS}",
         "--min-split-size=1M",
-        "--max-tries=5",
-        "--retry-wait=3",
-        "--connect-timeout=20",
+        "--max-tries=3",
+        "--retry-wait=2",
+        f"--connect-timeout={CONNECT_TIMEOUT}",
         "--timeout=30",
         "--summary-interval=0",
         "--console-log-level=warn",
@@ -276,7 +266,7 @@ async def download_httpx(
 ) -> Path:
 
     timeout = httpx.Timeout(
-        connect=60,
+        connect=CONNECT_TIMEOUT,
         read=300,
         write=30,
         pool=30,
@@ -287,148 +277,99 @@ async def download_httpx(
         max_keepalive_connections=2,
     )
 
-    last_error: Exception | None = None
+    resume_from = (
+        temporary_path.stat().st_size
+        if temporary_path.exists()
+        else 0
+    )
 
-    for attempt in range(1, 4):
+    request_headers = dict(headers)
 
-        resume_from = (
-            temporary_path.stat().st_size
-            if temporary_path.exists()
-            else 0
-        )
+    if resume_from:
+        request_headers["Range"] = f"bytes={resume_from}-"
 
-        request_headers = dict(headers)
+    downloaded = resume_from
+    last_update = 0
 
-        if resume_from:
-            request_headers["Range"] = f"bytes={resume_from}-"
+    async with httpx.AsyncClient(
+        headers=request_headers,
+        timeout=timeout,
+        follow_redirects=True,
+        trust_env=False,
+        limits=limits,
+    ) as client:
 
-        downloaded = resume_from
-        last_update = 0
-        start_time = time.monotonic()
+        async with client.stream("GET", url) as response:
 
-        try:
-            print(
-                f"Download attempt {attempt}/3 "
-                f"(resume from {human(resume_from)})"
-            )
+            response.raise_for_status()
 
-            async with httpx.AsyncClient(
-                headers=request_headers,
-                timeout=timeout,
-                follow_redirects=True,
-                trust_env=False,
-                limits=limits,
-            ) as client:
+            if response.status_code == 206:
 
-                async with client.stream("GET", url) as response:
+                match = re.search(
+                    r"/(\d+)\s*$",
+                    response.headers.get("content-range", ""),
+                )
 
-                    response.raise_for_status()
+                total = (
+                    int(match.group(1))
+                    if match
+                    else resume_from + int(
+                        response.headers.get("content-length", 0)
+                    )
+                )
 
-                    if response.status_code == 206:
+                mode = "ab"
 
-                        match = re.search(
-                            r"/(\d+)\s*$",
-                            response.headers.get("content-range", ""),
-                        )
+            else:
 
-                        total = (
-                            int(match.group(1))
-                            if match
-                            else resume_from + int(
-                                response.headers.get("content-length", 0)
-                            )
-                        )
+                total = int(
+                    response.headers.get("content-length", 0)
+                )
 
-                        mode = "ab"
+                downloaded = 0
+                mode = "wb"
 
-                    else:
+            with open(temporary_path, mode) as file:
 
-                        total = int(
-                            response.headers.get("content-length", 0)
-                        )
+                async for chunk in response.aiter_bytes(
+                    chunk_size=CHUNK_SIZE
+                ):
 
-                        downloaded = 0
-                        mode = "wb"
+                    if not chunk:
+                        continue
 
-                    with open(temporary_path, mode) as file:
+                    file.write(chunk)
+                    downloaded += len(chunk)
 
-                        async for chunk in response.aiter_bytes(
-                            chunk_size=CHUNK_SIZE
-                        ):
+                    now = time.monotonic()
 
-                            if not chunk:
-                                continue
+                    if progress_callback and now - last_update >= 2:
+                        await progress_callback(downloaded, total)
+                        last_update = now
 
-                            file.write(chunk)
-                            downloaded += len(chunk)
+    if downloaded == 0:
+        raise RuntimeError("Downloaded file is empty.")
 
-                            now = time.monotonic()
+    return temporary_path
 
-                            if (
-                                progress_callback
-                                and now - last_update >= 2
-                            ):
 
-                                await progress_callback(
-                                    downloaded,
-                                    total,
-                                )
-
-                                last_update = now
-
-            if downloaded == 0:
-                raise RuntimeError("Downloaded file is empty.")
-
-            print(
-                f"Download completed: {human(downloaded)} "
-                f"in {time.monotonic() - start_time:.2f}s"
-            )
-
-            return temporary_path
-
-        except (
-            httpx.ConnectTimeout,
-            httpx.ReadTimeout,
-            httpx.ConnectError,
-            httpx.ReadError,
-            httpx.WriteError,
-            httpx.RemoteProtocolError,
-            httpx.PoolTimeout,
-        ) as error:
-
-            last_error = error
-
-            print(
-                f"Attempt {attempt}/3 failed: "
-                f"{type(error).__name__}: {error}"
-            )
-
-            if attempt < 3:
-                await asyncio.sleep(attempt * 5)
-
-        except httpx.HTTPStatusError as error:
-
-            raise RuntimeError(
-                f"CDN rejected: HTTP "
-                f"{error.response.status_code} for "
-                f"{error.request.url.host}"
-            ) from error
-
-    raise RuntimeError(
-        f"Download failed after 3 attempts "
-        f"({type(last_error).__name__}: "
-        f"{last_error or 'no details'})"
-    ) from last_error
+def _cleanup(temporary_path: Path, output_path: Path) -> None:
+    temporary_path.unlink(missing_ok=True)
+    Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
+    output_path.unlink(missing_ok=True)
 
 
 async def download(
-    url: str,
+    url: str | list[str],
     filename: str,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
 
-    if not url.startswith("https://"):
-        raise ValueError("Only HTTPS download URLs are supported.")
+    urls = [url] if isinstance(url, str) else list(dict.fromkeys(url))
+    urls = [item for item in urls if item.startswith("https://")]
+
+    if not urls:
+        raise ValueError("No HTTPS download URLs are supported.")
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -445,63 +386,80 @@ async def download(
 
     use_aria2 = aria2_available() and not DISABLE_ARIA2
 
-    try:
-        if use_aria2:
+    failures: list[str] = []
 
-            try:
-                await download_aria2(
-                    url,
-                    temporary_path,
-                    headers,
-                    progress_callback,
-                )
+    for index, candidate in enumerate(urls, start=1):
 
-            except Exception as error:
+        host = httpx.URL(candidate).host
 
-                print(
-                    f"aria2c path failed "
-                    f"({type(error).__name__}: {error}) -> "
-                    f"single connection"
-                )
+        print(f"Host {index}/{len(urls)}: {host}")
 
-                temporary_path.unlink(missing_ok=True)
-                Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
+        _cleanup(temporary_path, output_path)
+
+        try:
+
+            if use_aria2:
+
+                try:
+                    await download_aria2(
+                        candidate,
+                        temporary_path,
+                        headers,
+                        progress_callback,
+                    )
+
+                except Exception as error:
+
+                    print(
+                        f"aria2c {host} failed "
+                        f"({type(error).__name__}: {error}) -> "
+                        f"single connection"
+                    )
+
+                    _cleanup(temporary_path, output_path)
+
+                    await download_httpx(
+                        candidate,
+                        temporary_path,
+                        headers,
+                        progress_callback,
+                    )
+
+            else:
 
                 await download_httpx(
-                    url,
+                    candidate,
                     temporary_path,
                     headers,
                     progress_callback,
                 )
 
-        else:
+            if (
+                not temporary_path.exists()
+                or temporary_path.stat().st_size == 0
+            ):
+                raise RuntimeError("Downloaded file is empty.")
 
-            print(
-                "aria2c off (DISABLE_ARIA2 set ya install nahi hai), "
-                "single connection"
+            os.replace(temporary_path, output_path)
+
+            Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
+
+            print(f"Download OK from {host}")
+            return output_path
+
+        except Exception as error:
+
+            failures.append(
+                f"{host}: {type(error).__name__}: {error}"
             )
 
-            await download_httpx(
-                url,
-                temporary_path,
-                headers,
-                progress_callback,
-            )
+            print(f"Host {host} failed: {type(error).__name__}: {error}")
 
-        if not temporary_path.exists() or temporary_path.stat().st_size == 0:
-            raise RuntimeError("Downloaded file is empty.")
+    _cleanup(temporary_path, output_path)
 
-        os.replace(temporary_path, output_path)
-
-        Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
-
-        return output_path
-
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        Path(str(temporary_path) + ".aria2").unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
-        raise
+    raise RuntimeError(
+        "Sabhi hosts fail hue -> " + " ; ".join(failures)[:600]
+    )
 
 
 async def download_thumbnail(
@@ -543,4 +501,4 @@ async def download_thumbnail(
     except Exception:
         output_path.unlink(missing_ok=True)
         raise
-                               
+    
