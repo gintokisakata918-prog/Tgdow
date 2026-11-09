@@ -427,20 +427,15 @@ async def process_video(
                 download_last_update,
             )
 
-        loop = asyncio.get_running_loop()
+        candidates = build_candidates(metadata, video_id)
 
-        def ytdlp_progress(data):
-            if data.get("status") not in ("downloading", "finished"):
-                return
-            current = int(data.get("downloaded_bytes") or 0)
-            total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
-            asyncio.run_coroutine_threadsafe(download_progress(current, total), loop)
+        if stream_url and stream_url not in candidates:
+            candidates.insert(0, stream_url)
 
-        video_path = await ytdlp_download(
-            url=url,
-            resolution=selected_resolution or 1080,
-            filename=filename,
-            progress_hook=ytdlp_progress,
+        video_path = await download(
+            candidates,
+            filename,
+            progress_callback=download_progress,
         )
 
         await show_progress(

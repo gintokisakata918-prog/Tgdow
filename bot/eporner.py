@@ -23,7 +23,7 @@ def parse_id(url: str) -> str:
 def get_resolution(value: Any) -> int:
     if isinstance(value, int): return value
     if not isinstance(value, str): return 0
-    match = re.search(r"(?<!\\d)(\\d{3,4})\\s*p?", value, re.I)
+    match = re.search(r"(?<!\d)(\d{3,4})\s*p?", value, re.I)
     return int(match.group(1)) if match else 0
 
 async def fetch_meta(video_id: str) -> dict[str, Any]:
