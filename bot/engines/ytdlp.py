@@ -63,7 +63,7 @@ async def extract(url: str, max_res: int = MAX_RES) -> dict[str, Any]:
 def _download(url: str, resolution: int, output: Path, progress_hook: Callable | None):
     output.parent.mkdir(parents=True, exist_ok=True)
     options = _options()
-    options.update({"format": f"best[height<={resolution}]",
+    options.update({"format": f"best[height<={resolution}]/bestvideo[height<={resolution}]+bestaudio",
                     "outtmpl": str(output.with_suffix(".%(ext)s")),
                     "merge_output_format": "mp4", "continuedl": True,
                     "overwrites": True,
