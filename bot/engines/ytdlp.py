@@ -2,9 +2,11 @@
 from __future__ import annotations
 import asyncio
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 import yt_dlp
+import httpx
 from bot.config import DOWNLOAD_DIR, MAX_RES, USER_AGENT, EPORNER_REFERER
 
 class YtDlpError(RuntimeError):
@@ -13,8 +15,12 @@ class YtDlpError(RuntimeError):
 def _options():
     return {
         "quiet": True, "no_warnings": True, "noplaylist": True,
-        "socket_timeout": 30, "retries": 3, "fragment_retries": 3,
-        "extractor_retries": 2,
+        "socket_timeout": 60,
+        "retries": 10, "fragment_retries": 10, "extractor_retries": 3,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "source_address": "0.0.0.0",
+        "nocheckcertificate": True,
+        "continuedl": True,
         "http_headers": {"User-Agent": USER_AGENT, "Referer": EPORNER_REFERER},
     }
 
@@ -60,33 +66,59 @@ async def extract(url: str, max_res: int = MAX_RES) -> dict[str, Any]:
             "tags": info.get("tags") or [], "webpage_url": info.get("webpage_url") or url,
             "formats": formats}
 
-def _download(url: str, resolution: int, output: Path, progress_hook: Callable | None):
+def _download_once(stream_url: str, referer: str | None, output: Path,
+                    progress_hook: Callable | None):
+    headers = {"User-Agent": USER_AGENT, "Referer": referer or EPORNER_REFERER}
+    timeout = httpx.Timeout(60.0, connect=30.0)
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        with client.stream("GET", stream_url) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length") or 0)
+            done = 0
+            with output.open("wb") as file:
+                for chunk in response.iter_bytes(1 << 20):
+                    if not chunk:
+                        continue
+                    file.write(chunk)
+                    done += len(chunk)
+                    if progress_hook:
+                        progress_hook({
+                            "status": "downloading",
+                            "downloaded_bytes": done,
+                            "total_bytes": total,
+                        })
+    if not output.is_file() or output.stat().st_size <= 0:
+        raise YtDlpError("The server returned an empty video file.")
+    return output
+
+
+def _download(url: str, resolution: int, output: Path,
+              progress_hook: Callable | None):
     output.parent.mkdir(parents=True, exist_ok=True)
-    options = _options()
-    options.update({"format": f"best[height<={resolution}]/bestvideo[height<={resolution}]+bestaudio",
-                    "outtmpl": str(output.with_suffix(".%(ext)s")),
-                    "merge_output_format": "mp4", "continuedl": True,
-                    "overwrites": True,
-                    "progress_hooks": [progress_hook] if progress_hook else []})
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            prepared = Path(ydl.prepare_filename(info))
-        paths = [prepared, prepared.with_suffix(".mp4")]
-        final = next((p for p in paths if p.is_file()), None)
-        if final is None:
-            matches = sorted(output.parent.glob(output.stem + ".*"),
-                             key=lambda p: p.stat().st_mtime, reverse=True)
-            final = matches[0] if matches else None
-        if final is None or final.stat().st_size <= 0:
-            raise YtDlpError("Download finished but no valid output file was found.")
-        target = output.with_suffix(final.suffix)
-        if final != target:
-            if target.exists(): target.unlink()
-            final.replace(target)
-        return target
-    except yt_dlp.utils.DownloadError as exc:
-        raise YtDlpError(str(exc).strip() or "Video download failed.") from exc
+    last = None
+    for attempt in range(1, 4):
+        try:
+            info = _extract(url)
+            formats = _normalise_formats(info, resolution)
+            selected = next(
+                (item for item in formats
+                 if item["resolution"] == f"{resolution}p"),
+                None,
+            )
+            selected = selected or (formats[-1] if formats else None)
+            if not selected:
+                raise YtDlpError(
+                    f"No downloadable format found up to {resolution}p."
+                )
+            return _download_once(
+                selected["url"], EPORNER_REFERER, output, progress_hook
+            )
+        except Exception as exc:
+            last = exc
+            output.unlink(missing_ok=True)
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    raise YtDlpError(str(last).strip() or "Video download failed.") from last
 
 async def download(url: str, resolution: int, filename: str,
                    progress_hook: Callable | None = None) -> Path:
