@@ -1,63 +1,483 @@
-"""Eporner URL validation and metadata compatibility layer."""
 import re
 from typing import Any
 from urllib.parse import urlparse
-from bot.config import MAX_RES
-from bot.engines.ytdlp import extract, YtDlpError
 
-VIDEO_ID_PATTERN = re.compile(r"(?:video-|hd-porn/|embed/)([A-Za-z0-9]{5,12})", re.I)
+import httpx
 
-class EpornerError(RuntimeError): pass
-class VideoNotFoundError(EpornerError): pass
-class NoStreamsAvailableError(EpornerError): pass
+from bot.config import (
+    EPORNER_API,
+    EPORNER_REFERER,
+    USER_AGENT,
+    MAX_RES,
+)
+
+
+VIDEO_ID_PATTERN = re.compile(
+    r"(?:video-|hd-porn/|embed/)([A-Za-z0-9]{5,12})",
+    re.IGNORECASE,
+)
+
+RESOLUTION_PATTERN = re.compile(
+    r"(\d{3,4})p?",
+    re.IGNORECASE,
+)
+
+
+class EpornerError(Exception):
+    pass
+
+
+class VideoNotFoundError(EpornerError):
+    pass
+
+
+class NoStreamsAvailableError(EpornerError):
+    pass
+
 
 def parse_id(url: str) -> str:
-    if not isinstance(url, str): raise ValueError("Invalid URL.")
+    if not isinstance(url, str):
+        raise ValueError("Invalid URL.")
+
     parsed = urlparse(url.strip())
-    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("eporner.com", "www.eporner.com"):
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid URL scheme.")
+
+    if parsed.hostname not in (
+        "eporner.com",
+        "www.eporner.com",
+    ):
         raise ValueError("Only Eporner URLs are supported.")
+
     match = VIDEO_ID_PATTERN.search(parsed.path)
-    if not match: raise ValueError("Video ID not found in URL.")
+
+    if not match:
+        raise ValueError("Video ID not found in URL.")
+
     return match.group(1)
 
+
 def get_resolution(value: Any) -> int:
-    if isinstance(value, int): return value
-    if not isinstance(value, str): return 0
-    match = re.search(r"(?<!\d)(\d{3,4})\s*p?", value, re.I)
+    if not isinstance(value, str):
+        return 0
+
+    match = RESOLUTION_PATTERN.search(value)
+
     return int(match.group(1)) if match else 0
 
+
+def encode_base36(number: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    if number == 0:
+        return "0"
+
+    result = ""
+
+    while number:
+        number, remainder = divmod(number, 36)
+        result = alphabet[remainder] + result
+
+    return result
+
+
+def calculate_hash(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        raise EpornerError("Invalid player hash.")
+
+    return "".join(
+        encode_base36(int(value[index:index + 8], 16))
+        for index in range(0, 32, 8)
+    )
+
+
+async def fetch_metadata(
+    client: httpx.AsyncClient,
+    video_id: str,
+) -> dict[str, Any]:
+
+    params = {
+        "id": video_id,
+        "thumbsize": "big",
+        "per_page": 1,
+    }
+
+    try:
+        response = await client.get(
+            EPORNER_API,
+            params=params,
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+    except (httpx.HTTPError, ValueError) as exc:
+        raise EpornerError(
+            f"Eporner API request failed: {exc}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise VideoNotFoundError("Invalid API response.")
+
+    if data.get("error"):
+        raise VideoNotFoundError(str(data["error"]))
+
+    if isinstance(data.get("videos"), list):
+        videos = data["videos"]
+
+        video = next(
+            (
+                item for item in videos
+                if isinstance(item, dict)
+                and str(item.get("id", "")) == video_id
+            ),
+            None,
+        )
+
+        if video is None:
+            raise VideoNotFoundError("Video not found.")
+
+        data = video
+
+    if str(data.get("id", "")) != video_id:
+        raise VideoNotFoundError("Video ID mismatch.")
+
+    return data
+
+
+async def fetch_player_streams(
+    client: httpx.AsyncClient,
+    video_id: str,
+) -> list[dict[str, Any]]:
+
+    page_url = f"https://www.eporner.com/embed/{video_id}/"
+
+    try:
+        response = await client.get(page_url)
+        response.raise_for_status()
+        html = response.text
+
+    except httpx.HTTPError as exc:
+        raise EpornerError(
+            f"Could not open Eporner embed page: {exc}"
+        ) from exc
+
+    hash_match = re.search(
+        r'EP\.video\.player\.hash\s*=\s*["\']([0-9a-fA-F]{32})',
+        html,
+    )
+
+    if not hash_match:
+        raise NoStreamsAvailableError(
+            "Player hash not found on embed page."
+        )
+
+    player_hash = calculate_hash(hash_match.group(1))
+
+    params = {
+        "hash": player_hash,
+        "device": "generic",
+        "domain": "www.eporner.com",
+        "fallback": "false",
+        "embed": "false",
+        "supportedFormats": "dash,mp4",
+    }
+
+    xhr_url = f"https://www.eporner.com/xhr/video/{video_id}"
+    streams = []
+
+    try:
+        response = await client.get(
+            xhr_url,
+            params=params,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": page_url,
+            },
+        )
+
+        response.raise_for_status()
+        player_data = response.json()
+
+    except (httpx.HTTPError, ValueError):
+        player_data = {}
+
+    if not isinstance(player_data, dict):
+        player_data = {}
+
+    if player_data.get("available") is False:
+        raise VideoNotFoundError(
+            player_data.get(
+                "message",
+                "Video is unavailable.",
+            )
+        )
+
+    sources = player_data.get("sources", {})
+
+    if isinstance(sources, dict):
+        for source_type, formats in sources.items():
+
+            if source_type == "hls":
+                continue
+
+            if not isinstance(formats, dict):
+                continue
+
+            for format_id, format_data in formats.items():
+
+                if not isinstance(format_data, dict):
+                    continue
+
+                source_url = format_data.get("src")
+
+                if not isinstance(source_url, str):
+                    continue
+
+                if not source_url.startswith("https://"):
+                    continue
+
+                resolution_match = re.search(
+                    r"(\d{3,4})p",
+                    str(format_id),
+                    re.IGNORECASE,
+                )
+
+                if not resolution_match:
+                    continue
+
+                resolution = int(resolution_match.group(1))
+
+                streams.append({
+                    "resolution": f"{resolution}p",
+                    "url": source_url,
+                    "type": source_type,
+                })
+
+    content_match = re.search(
+        r'"contentUrl"\s*:\s*"([^"]+)"',
+        html,
+    )
+
+    if content_match:
+
+        content_url = content_match.group(1).replace("\\/", "/")
+
+        if content_url.startswith("https://"):
+
+            height_match = re.search(
+                r'"height"\s*:\s*"?(\d+)',
+                html,
+            )
+
+            resolution = (
+                height_match.group(1)
+                if height_match
+                else "1080"
+            )
+
+            streams.append({
+                "resolution": f"{resolution}p",
+                "url": content_url,
+                "type": "direct",
+            })
+
+    unique_streams = {}
+
+    for stream in streams:
+        unique_streams[
+            (
+                stream["resolution"],
+                stream["url"],
+            )
+        ] = stream
+
+    if not unique_streams:
+        raise NoStreamsAvailableError(
+            "No video streams found."
+        )
+
+    return list(unique_streams.values())
+
+
 async def fetch_meta(video_id: str) -> dict[str, Any]:
-    if not re.fullmatch(r"[A-Za-z0-9]{5,12}", video_id): raise ValueError("Invalid video ID.")
-    url = f"https://www.eporner.com/video-{video_id}/"
-    try: info = await extract(url, MAX_RES)
-    except YtDlpError as exc: raise NoStreamsAvailableError(str(exc)) from exc
-    return {"id": video_id, "title": info["title"], "length_sec": info.get("duration", 0),
-            "thumbnail": info.get("thumbnail"), "keywords": info.get("tags") or [],
-            "videos": info["formats"], "webpage_url": info.get("webpage_url") or url}
 
-def pick_source(metadata: dict[str, Any], max_res: int = MAX_RES) -> dict[str, Any]:
-    streams = [item for item in metadata.get("videos", []) if get_resolution(item.get("resolution")) <= max_res]
-    if not streams: raise NoStreamsAvailableError(f"No stream available below {max_res}p.")
-    return max(streams, key=lambda item: get_resolution(item.get("resolution")))
+    if not re.fullmatch(r"[A-Za-z0-9]{5,12}", video_id):
+        raise ValueError("Invalid video ID.")
 
-def build_candidates(metadata: dict[str, Any], video_id: str) -> list[str]:
-    return [item["url"] for item in metadata.get("videos", []) if isinstance(item, dict)
-            and isinstance(item.get("url"), str) and item["url"].startswith(("https://", "http://"))]
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": EPORNER_REFERER,
+    }
+
+    timeout = httpx.Timeout(
+        connect=30,
+        read=60,
+        write=30,
+        pool=30,
+    )
+
+    async with httpx.AsyncClient(
+        headers=headers,
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
+
+        metadata = await fetch_metadata(
+            client,
+            video_id,
+        )
+
+        streams = await fetch_player_streams(
+            client,
+            video_id,
+        )
+
+    metadata["videos"] = streams
+
+    if not streams:
+        raise NoStreamsAvailableError(
+            "Eporner player returned no direct MP4 streams."
+        )
+
+    return metadata
+
+
+def pick_source(
+    metadata: dict[str, Any],
+    max_res: int = MAX_RES,
+) -> dict[str, Any]:
+
+    if max_res <= 0:
+        raise ValueError("MAX_RES must be positive.")
+
+    streams = metadata.get("videos", [])
+
+    suitable = [
+        stream
+        for stream in streams
+        if get_resolution(
+            stream.get("resolution", "")
+        ) <= max_res
+    ]
+
+    if not suitable:
+        available = sorted({
+            get_resolution(
+                stream.get("resolution", "")
+            )
+            for stream in streams
+        })
+
+        if available:
+            raise NoStreamsAvailableError(
+                f"No stream available below {max_res}p. "
+                f"Available: {available}"
+            )
+
+        raise NoStreamsAvailableError(
+            "No downloadable streams found."
+        )
+
+    return max(
+        suitable,
+        key=lambda stream: get_resolution(
+            stream.get("resolution", "")
+        ),
+    )
+
+
+def build_candidates(
+    metadata: dict[str, Any],
+    video_id: str,
+) -> list[str]:
+    """Sabhi mumkin download URLs, best pehle."""
+
+    urls: list[str] = []
+
+    for stream in sorted(
+        metadata.get("videos", []),
+        key=lambda item: get_resolution(
+            item.get("resolution", "")
+        ),
+        reverse=True,
+    ):
+        url = stream.get("url")
+
+        if (
+            isinstance(url, str)
+            and url.startswith("https://")
+            and url not in urls
+        ):
+            urls.append(url)
+
+    for guess in (
+        f"https://gvideo.eporner.com/{video_id}/{video_id}.mp4",
+        f"https://www.eporner.com/video/{video_id}/{video_id}.mp4",
+    ):
+        if guess not in urls:
+            urls.append(guess)
+
+    return urls
+
 
 def get_duration(metadata: dict[str, Any]) -> int:
-    try: return max(0, int(metadata.get("length_sec") or 0))
-    except (TypeError, ValueError): return 0
+    try:
+        minutes = metadata.get("length_min", 0)
+        seconds = metadata.get("length_sec", 0)
+
+        if isinstance(minutes, str) and ":" in minutes:
+            parts = minutes.split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+
+        return max(
+            0,
+            int(minutes) * 60 + int(seconds),
+        )
+
+    except (TypeError, ValueError):
+        return 0
+
 
 def get_keywords(metadata: dict[str, Any]) -> list[str]:
-    values = metadata.get("keywords") or []
-    if isinstance(values, str): values = values.split(",")
-    return [str(item).strip() for item in values if str(item).strip()]
+    keywords = metadata.get("keywords", "")
+
+    if isinstance(keywords, list):
+        values = keywords
+
+    elif isinstance(keywords, str):
+        values = keywords.split(",")
+
+    else:
+        return []
+
+    return [
+        item.strip()
+        for item in values
+        if isinstance(item, str) and item.strip()
+    ]
+
 
 def get_thumbnail(metadata: dict[str, Any]) -> str | None:
-    value = metadata.get("thumbnail")
-    return value if isinstance(value, str) and value.startswith(("https://", "http://")) else None
+    thumbnail = metadata.get("thumbnail")
+
+    if not isinstance(thumbnail, str):
+        thumbnail = metadata.get("default_thumb", "")
+
+    if isinstance(thumbnail, str) and thumbnail.startswith("https://"):
+        return thumbnail
+
+    return None
+
 
 def get_title(metadata: dict[str, Any]) -> str:
-    title = metadata.get("title")
-    if not isinstance(title, str) or not title.strip(): raise VideoNotFoundError("Video title unavailable.")
+    title = metadata.get("title", "")
+
+    if not isinstance(title, str) or not title.strip():
+        raise VideoNotFoundError(
+            "Video title unavailable."
+        )
+
     return title.strip()
+    

@@ -109,7 +109,7 @@ async def extract(url: str, max_res: int = MAX_RES) -> dict[str, Any]:
 
 def _download(url: str, resolution: int, output: Path, progress_hook: Callable | None) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
-    fmt = f"best[height<={resolution}]"
+    fmt = f"best[height<={resolution}]/best"
     options = _options(quiet=True)
     options.update({
         "format": fmt,
