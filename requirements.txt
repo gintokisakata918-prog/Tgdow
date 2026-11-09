@@ -1,18 +1,15 @@
 # Telegram MTProto
 Telethon==1.42.0
-
-# HTTP client
+# HTTP client / metadata fallback
 httpx==0.28.1
-
-# Environment configuration
+# Video extraction and downloading
+yt-dlp[default]
+# Environment
 python-dotenv==1.2.1
-
 # Async utilities
 aiofiles==24.1.0
-
 # Image processing
 Pillow==12.0.0
-
 # Logging
 colorlog==6.10.1
 aiosqlite==0.21.0
