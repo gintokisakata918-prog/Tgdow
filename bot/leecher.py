@@ -41,10 +41,8 @@ from bot.eporner import (
     get_thumbnail,
 )
 
-from bot.downloader import (
-    download,
-    download_thumbnail,
-)
+from bot.downloader import download_thumbnail
+from bot.engines.ytdlp import download as ytdlp_download
 
 
 logger = logging.getLogger(__name__)
@@ -427,15 +425,20 @@ async def process_video(
                 download_last_update,
             )
 
-        candidates = build_candidates(metadata, video_id)
+        loop = asyncio.get_running_loop()
 
-        if stream_url and stream_url not in candidates:
-            candidates.insert(0, stream_url)
+        def ytdlp_progress(data):
+            if data.get("status") not in ("downloading", "finished"):
+                return
+            current = int(data.get("downloaded_bytes") or 0)
+            total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
+            asyncio.run_coroutine_threadsafe(download_progress(current, total), loop)
 
-        video_path = await download(
-            candidates,
-            filename,
-            progress_callback=download_progress,
+        video_path = await ytdlp_download(
+            url=url,
+            resolution=selected_resolution or 1080,
+            filename=filename,
+            progress_hook=ytdlp_progress,
         )
 
         await show_progress(

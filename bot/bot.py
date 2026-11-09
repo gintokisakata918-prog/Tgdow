@@ -44,39 +44,12 @@ bot_client = TelegramClient(
 # --------------------------------------------------
 
 def find_qualities(metadata):
-
-    found = set()
-
-    def scan(value):
-
-        if isinstance(value, dict):
-
-            for key, item in value.items():
-
-                resolution = get_resolution(str(key))
-
-                if resolution in (480, 720, 1080):
-                    found.add(resolution)
-
-                scan(item)
-
-        elif isinstance(value, list):
-
-            for item in value:
-                scan(item)
-
-        elif isinstance(value, str):
-
-            resolution = get_resolution(value)
-
-            if resolution in (480, 720, 1080):
-                found.add(resolution)
-
-    scan(metadata.get("videos", {}))
-    scan(metadata.get("sources", {}))
-
-    return sorted(found)
-
+    return sorted({
+        get_resolution(item.get("resolution"))
+        for item in metadata.get("videos", [])
+        if isinstance(item, dict)
+        and get_resolution(item.get("resolution")) in (480, 720, 1080)
+    })
 
 # --------------------------------------------------
 # HEALTH SERVER
