@@ -11,6 +11,7 @@ from bot.config import (
     ALLOWED_USERS,
     HOST,
     PORT,
+    MAX_RES,
     validate_config,
 )
 
@@ -44,11 +45,13 @@ bot_client = TelegramClient(
 # --------------------------------------------------
 
 def find_qualities(metadata):
+    """Return every quality actually present in the extracted video formats."""
     return sorted({
-        get_resolution(item.get("resolution"))
+        resolution
         for item in metadata.get("videos", [])
         if isinstance(item, dict)
-        and get_resolution(item.get("resolution")) in (480, 720, 1080)
+        for resolution in [get_resolution(item.get("resolution"))]
+        if 144 <= resolution <= MAX_RES
     })
 
 # --------------------------------------------------
@@ -226,16 +229,13 @@ async def video_handler(event):
 
         row = []
 
-        for quality in (480, 720, 1080):
-
-            if quality in qualities:
-
-                row.append(
-                    Button.inline(
-                        f"{quality}P",
-                        data=f"dl:{video_id}:{quality}".encode(),
-                    )
+        for quality in qualities:
+            row.append(
+                Button.inline(
+                    f"{quality}P",
+                    data=f"dl:{video_id}:{quality}".encode(),
                 )
+            )
 
         if row:
             buttons.append(row)
@@ -289,7 +289,7 @@ async def quality_callback(event):
 
         resolution = int(quality_text)
 
-        if resolution not in (480, 720, 1080):
+        if not 144 <= resolution <= MAX_RES:
 
             await event.answer(
                 "Invalid quality.",
